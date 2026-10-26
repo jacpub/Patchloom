@@ -5,12 +5,16 @@ on:
     - 'Cargo.lock'
     - '**/Cargo.toml'
     - '.github/workflows/continuous-integration.yml'
+    - 'README.md'
+    - 'docs/**'
   pull_request:
     paths:
     - '**.rs'
     - 'Cargo.lock'
     - '**/Cargo.toml'
     - '.github/workflows/continuous-integration.yml'
+    - 'README.md'
+    - 'docs/**'
 
 name: Continuous-integration
 
