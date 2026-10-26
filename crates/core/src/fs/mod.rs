@@ -9,11 +9,13 @@ use std::sync::Mutex;
 
 mod addon;
 pub mod backup;
+mod install;
 mod save;
 #[cfg(feature = "gui")]
 mod theme;
 
-pub use addon::{delete_addons, delete_saved_variables, install_addon};
+pub use addon::{delete_addons, delete_saved_variables};
+pub use install::install_addon;
 pub use save::PersistentData;
 #[cfg(feature = "gui")]
 pub use theme::{import_theme, load_user_themes};
