@@ -1,4 +1,6 @@
-## Ajour is no longer maintained. Please read https://github.com/ajour/ajour/issues/746.
+# Ajour is no longer maintained
+
+Please read [ajour/ajour#746](https://github.com/ajour/ajour/issues/746).
 Thank you all for the support, the feedback and for being an awesome community.
 
 ![ajour banner](./resources/screenshots/ajour-banner.jpg)

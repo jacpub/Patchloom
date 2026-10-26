@@ -17,14 +17,13 @@ name: Continuous-integration
 permissions:
   contents: read
 
-env:
-  XDG_CONFIG_HOME: ${{ runner.temp }}/patchloom-config
-
 jobs:
   check:
     name: Check
     runs-on: ubuntu-latest
     steps:
+      - name: Isolate application data
+        run: echo "XDG_CONFIG_HOME=$RUNNER_TEMP/patchloom-config" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
       - uses: actions/cache@v4
         with:
@@ -51,6 +50,8 @@ jobs:
     name: Test Suite
     runs-on: ubuntu-latest
     steps:
+      - name: Isolate application data
+        run: echo "XDG_CONFIG_HOME=$RUNNER_TEMP/patchloom-config" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
       - name: Install dependencies
         run: sudo apt install libxkbcommon-dev
@@ -95,6 +96,8 @@ jobs:
     name: Clippy
     runs-on: ubuntu-latest
     steps:
+      - name: Isolate application data
+        run: echo "XDG_CONFIG_HOME=$RUNNER_TEMP/patchloom-config" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
       - uses: actions/cache@v4
         with:
