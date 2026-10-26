@@ -27,6 +27,13 @@ jobs:
           echo "XDG_CONFIG_HOME=$RUNNER_TEMP/patchloom-config" >> "$GITHUB_ENV"
           cmake --version
       - uses: actions/checkout@v4
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libfreetype-dev libfontconfig-dev libxkbcommon-dev
+          pkg-config --atleast-version=18.5.12 freetype2
+          pkg-config --atleast-version=2.11.1 fontconfig
+          pkg-config --modversion freetype2 fontconfig xkbcommon
       - uses: actions/cache@v4
         with:
           path: |
@@ -57,8 +64,13 @@ jobs:
           echo "XDG_CONFIG_HOME=$RUNNER_TEMP/patchloom-config" >> "$GITHUB_ENV"
           cmake --version
       - uses: actions/checkout@v4
-      - name: Install dependencies
-        run: sudo apt install libxkbcommon-dev
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libfreetype-dev libfontconfig-dev libxkbcommon-dev
+          pkg-config --atleast-version=18.5.12 freetype2
+          pkg-config --atleast-version=2.11.1 fontconfig
+          pkg-config --modversion freetype2 fontconfig xkbcommon
       - uses: actions/cache@v4
         with:
           path: |
@@ -105,6 +117,13 @@ jobs:
           echo "XDG_CONFIG_HOME=$RUNNER_TEMP/patchloom-config" >> "$GITHUB_ENV"
           cmake --version
       - uses: actions/checkout@v4
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libfreetype-dev libfontconfig-dev libxkbcommon-dev
+          pkg-config --atleast-version=18.5.12 freetype2
+          pkg-config --atleast-version=2.11.1 fontconfig
+          pkg-config --modversion freetype2 fontconfig xkbcommon
       - uses: actions/cache@v4
         with:
           path: |
