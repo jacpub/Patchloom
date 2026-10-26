@@ -66,9 +66,12 @@ execute the Windows-only process tests.
 
 Manual release, crates publication and translation-import workflows remain
 unchanged and must not be dispatched during revival. Development CI uploads no
-packages and creates no tags or releases. The Linux workflow has not yet run on
-GitHub; runner/action/dependency compatibility is still unverified. Existing
-strict lint and possible legacy infrastructure failures must remain visible.
+packages and creates no tags or releases. Ubuntu 24.04 CI with Rust 1.99.1 and
+explicit native font/XKB prerequisites now passes both build/test
+configurations:
+33 tests per configuration, with one catalog network test excluded. Linux does
+not run the Windows-only subprocess tests. Strict lint still fails on existing
+widget findings; no lint suppression was added.
 
 ## Before live trials or distribution
 
