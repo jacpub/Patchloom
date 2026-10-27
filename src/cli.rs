@@ -70,6 +70,25 @@ pub fn validate_opts_or_exit(
             author = env!("CARGO_PKG_AUTHORS"),
             setting = AppSettings::DisableHelpSubcommand)]
 pub struct Opts {
+    #[structopt(
+        long,
+        parse(from_os_str),
+        help = "Open a read-only preview of an explicitly selected copied WoW folder"
+    )]
+    pub preview: Option<PathBuf>,
+    #[structopt(
+        long,
+        requires = "preview",
+        help = "Check preview data without opening a window"
+    )]
+    pub preview_check: bool,
+    #[structopt(
+        long,
+        hidden = true,
+        requires = "preview",
+        help = "Check hidden native preview startup and exit"
+    )]
+    pub preview_window_check: bool,
     #[structopt(long = "data", help = "Path to a custom data directory for the app")]
     pub data_directory: Option<PathBuf>,
     #[structopt(long = "aa", help = "Enable / Disable Anti-aliasing (true / false)")]
@@ -156,5 +175,16 @@ fn str_to_backup_folder(s: &str) -> Result<BackupFolder, &'static str> {
         "screenshots" => Ok(BackupFolder::Screenshots),
         "fonts" => Ok(BackupFolder::Fonts),
         _ => Err("valid values are ['all','wtf','addons','config','screenshots','fonts']"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn preview_check_flags_require_an_explicit_path() {
+        for flag in ["--preview-check", "--preview-window-check"] {
+            assert!(Opts::from_iter_safe(["ajour", flag]).is_err());
+        }
     }
 }

@@ -1,3 +1,4 @@
+//! Patchloom metadata lookups, modified 2026-10-27; original Ajour GPLv3 applies.
 use crate::{
     error::{ParseError, RepositoryError},
     repository::{
@@ -261,19 +262,13 @@ impl Addon {
 
     /// Returns the version of the addon
     pub fn version(&self) -> Option<&str> {
-        if self
-            .metadata()
-            .map(|m| m.version.as_deref())
-            .flatten()
-            .is_some()
-        {
-            self.metadata().map(|m| m.version.as_deref()).flatten()
+        if self.metadata().and_then(|m| m.version.as_deref()).is_some() {
+            self.metadata().and_then(|m| m.version.as_deref())
         } else {
             self.folders
                 .iter()
                 .find(|f| f.id == self.primary_folder_id)
-                .map(|f| f.version.as_deref())
-                .flatten()
+                .and_then(|f| f.version.as_deref())
         }
     }
 
@@ -293,7 +288,7 @@ impl Addon {
 
     /// Returns the title of the addon.
     pub fn title(&self) -> &str {
-        let meta_title = self.metadata().map(|m| m.title.as_deref()).flatten();
+        let meta_title = self.metadata().and_then(|m| m.title.as_deref());
         let folder_title = self
             .primary_addon_folder()
             .map(|f| f.title.as_str())
@@ -304,11 +299,10 @@ impl Addon {
 
     /// Returns the author of the addon.
     pub fn author(&self) -> Option<&str> {
-        let meta_author = self.metadata().map(|m| m.author.as_deref()).flatten();
+        let meta_author = self.metadata().and_then(|m| m.author.as_deref());
         let folder_author = self
             .primary_addon_folder()
-            .map(|f| f.author.as_deref())
-            .flatten();
+            .and_then(|f| f.author.as_deref());
 
         meta_author.map_or(folder_author, Option::Some)
     }
@@ -317,40 +311,35 @@ impl Addon {
     pub fn game_version(&self) -> Option<&str> {
         if self
             .metadata()
-            .map(|m| m.game_version.as_deref())
-            .flatten()
+            .and_then(|m| m.game_version.as_deref())
             .filter(|s| !s.is_empty())
             .is_some()
         {
-            self.metadata().map(|m| m.game_version.as_deref()).flatten()
+            self.metadata().and_then(|m| m.game_version.as_deref())
         } else {
             self.folders
                 .iter()
                 .find(|f| f.id == self.primary_folder_id)
-                .map(|f| f.interface.as_deref())
-                .flatten()
+                .and_then(|f| f.interface.as_deref())
         }
     }
 
     /// Returns the notes of the addon.
     pub fn notes(&self) -> Option<&str> {
-        let meta_notes = self.metadata().map(|m| m.notes.as_deref()).flatten();
-        let folder_notes = self
-            .primary_addon_folder()
-            .map(|f| f.notes.as_deref())
-            .flatten();
+        let meta_notes = self.metadata().and_then(|m| m.notes.as_deref());
+        let folder_notes = self.primary_addon_folder().and_then(|f| f.notes.as_deref());
 
         meta_notes.map_or(folder_notes, Option::Some)
     }
 
     /// Returns the website url of the addon.
     pub fn website_url(&self) -> Option<&str> {
-        self.metadata().map(|m| m.website_url.as_deref()).flatten()
+        self.metadata().and_then(|m| m.website_url.as_deref())
     }
 
     /// Returns the changelog url of the addon.
     pub fn changelog_url(&self, default_release_channel: GlobalReleaseChannel) -> Option<String> {
-        let url = self.metadata().map(|m| m.changelog_url.clone()).flatten();
+        let url = self.metadata().and_then(|m| m.changelog_url.clone());
 
         match self.repository_kind() {
             Some(RepositoryKind::Git(GitKind::Github)) => {
@@ -367,8 +356,7 @@ impl Addon {
             Some(RepositoryKind::Curse) => {
                 let file = self
                     .relevant_release_package(default_release_channel)
-                    .map(|r| r.file_id)
-                    .flatten();
+                    .and_then(|r| r.file_id);
 
                 if let Some(file) = file {
                     url.map(|url| format!("{}/{}", url, file))
@@ -398,13 +386,10 @@ impl Addon {
     /// Returns the curse id of the addon, if applicable.
     pub fn curse_id(&self) -> Option<i32> {
         if self.repository_kind() == Some(RepositoryKind::Curse) {
-            self.repository()
-                .map(|r| r.id.parse::<i32>().ok())
-                .flatten()
+            self.repository().and_then(|r| r.id.parse::<i32>().ok())
         } else {
             self.primary_addon_folder()
-                .map(|f| f.repository_identifiers.curse)
-                .flatten()
+                .and_then(|f| f.repository_identifiers.curse)
         }
     }
 
@@ -414,8 +399,7 @@ impl Addon {
             self.repository().map(|r| r.id.as_str())
         } else {
             self.primary_addon_folder()
-                .map(|f| f.repository_identifiers.tukui.as_deref())
-                .flatten()
+                .and_then(|f| f.repository_identifiers.tukui.as_deref())
         }
     }
 
@@ -425,17 +409,14 @@ impl Addon {
             self.repository().map(|r| r.id.as_str())
         } else {
             self.primary_addon_folder()
-                .map(|f| f.repository_identifiers.wowi.as_deref())
-                .flatten()
+                .and_then(|f| f.repository_identifiers.wowi.as_deref())
         }
     }
 
     /// Returns the hub id of the addon, if applicable.
     pub fn hub_id(&self) -> Option<i32> {
         if self.repository_kind() == Some(RepositoryKind::Hub) {
-            self.repository()
-                .map(|r| r.id.parse::<i32>().ok())
-                .flatten()
+            self.repository().and_then(|r| r.id.parse::<i32>().ok())
         } else {
             None
         }
@@ -449,7 +430,7 @@ impl Addon {
     }
 
     pub fn file_id(&self) -> Option<i64> {
-        self.metadata().map(|f| f.file_id).flatten()
+        self.metadata().and_then(|f| f.file_id)
     }
 
     fn primary_addon_folder(&self) -> Option<&AddonFolder> {

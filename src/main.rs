@@ -6,6 +6,7 @@
 mod cli;
 mod command;
 mod gui;
+mod inventory_preview;
 mod localization;
 #[cfg(target_os = "windows")]
 mod process;
@@ -41,15 +42,23 @@ pub fn main() {
     // on the command line, Ajour functions as a CLI instead of launching the GUI.
     let is_cli = opts_result
         .as_ref()
-        .map(|o| &o.command)
-        .unwrap_or(&None)
-        .is_some();
+        .map(|o| o.command.is_some() || o.preview.is_some())
+        .unwrap_or(false);
 
     // This function validates whether or not we need to exit and print any message
     // due to arguments passed on the command line. If not, it will return a
     // parsed `Opts` struct. This also handles setting up our windows release build
     // fix that allows us to print to the console when not using the GUI.
     let opts = cli::validate_opts_or_exit(opts_result, is_cli, is_debug);
+
+    // Preview exits this branch before configuration, logs, self-update cleanup, tray or providers.
+    if opts.preview.is_some() {
+        if let Err(error) = inventory_preview::run(&opts) {
+            eprintln!("Patchloom preview: {}", error);
+            std::process::exit(1);
+        }
+        return;
+    }
 
     if let Some(data_dir) = &opts.data_directory {
         let mut config_dir = CONFIG_DIR.lock().unwrap();

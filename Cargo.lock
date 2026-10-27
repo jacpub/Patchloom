@@ -81,6 +81,7 @@ dependencies = [
  "serde_json",
  "strfmt",
  "structopt",
+ "tempfile",
  "timeago",
  "version-compare 0.0.11",
  "winapi 0.3.9",

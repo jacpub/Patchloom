@@ -1,5 +1,32 @@
 # Patchloom developer notes
 
+## Read-only inventory preview
+
+Use a disposable copied WoW root with `.build.info` and product directories:
+
+```sh
+cargo run --bin ajour --locked --features no-self-update -- --preview <copied-WoW-root>
+```
+
+The preview has its own startup path. It reads the supplied root without loading
+legacy configuration, starting self-update, contacting providers or creating
+application directories. Choose a detected product to inspect its addon folders.
+Rescan clears that choice. Unknown products and unresolved TOCs remain visible
+for review; the preview never chooses a fallback product or installs an update.
+Keep using copied fixtures while development continues.
+
+Add `--preview-check` to construct the same model and view without opening a
+window. It prints JSON and exits unsuccessfully when discovery needs review.
+The hidden `--preview-window-check` developer switch opens an invisible native
+window and exits after a short timer. Do not combine either check mode with
+legacy commands, `--data` or `--self-update-temp`.
+
+Starting the executable without `--preview` still enters the legacy application.
+The preview is an inventory milestone, with provider actions and recovery UI
+still to come. Its neutral draft surfaces await review against the saved
+Patchloom brand guide. Windows OpenGL startup has been checked with copied
+fixtures; visible layout, native macOS and Linux runtime checks remain pending.
+
 ## Restoring a retained original bundle
 
 The standalone `restore_originals` command previews the original bundle and
