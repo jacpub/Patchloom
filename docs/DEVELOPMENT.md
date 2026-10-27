@@ -130,3 +130,59 @@ before enabling an integration.
 
 Follow the [brand and public-copy guidance](BRAND_DIRECTION.md) for all
 Patchloom text and visuals.
+
+## Copied-install discovery
+
+Run the inventory command against a disposable copied root:
+
+```sh
+cargo run -p ajour-core --bin discover_wow --locked \
+  --features no-self-update -- <copied-WoW-root>
+```
+
+It prints YAML without loading application configuration, contacting
+providers or creating directories. Use disposable copies for development. Exit
+status 1 means the report contains an unresolved product or addon; status 2
+means the command arguments are invalid. Invalid root metadata is an error.
+
+Discovery reads active `.build.info` records and keeps modern product identities
+separate from the legacy `Flavor` configuration. Unknown products, future version
+families and duplicate active records require resolution. Existing configuration
+is preserved, including old TBC selections. The source-install command now passes
+its selected legacy flavor to repository metadata construction.
+
+Observed Blizzard US version-service responses on 2026-10-27 were:
+
+| Product | Version | Expected directory |
+| --- | --- | --- |
+| `wow` | `12.1.5.70575` | `_retail_` |
+| `wow_classic` | `5.5.4.70579` | `_classic_` |
+| `wow_classic_era` | `1.15.9.70576` | `_classic_era_` |
+| `wow_anniversary` | `2.5.6.70577` | `_anniversary_` |
+
+The service endpoints use
+`https://us.version.battle.net/v2/products/<product>/versions`.
+These observations establish product/version families; they do not establish
+which build a user has installed. Directory conventions follow the current
+[WowUp constants](https://github.com/WowUp/WowUp/blob/master/wowup-electron/src/common/constants.ts),
+and still need native installation verification. The build-info parser follows
+the typed fields used by
+[CascLib](https://github.com/ladislav-zezula/CascLib/blob/master/src/CascFiles.cpp).
+TOC suffixes and interface-number calculation follow
+[BigWigs packager](https://github.com/BigWigsMods/packager/blob/master/release.sh).
+
+The report selects a TOC candidate only when exactly one recognized filename
+declares the exact client interface. It does not reproduce the full game loader:
+older interfaces, qualified Interface headers and unrecognized suffixes remain
+unresolved. A selected candidate does not certify addon compatibility or permit
+installation. PTR and other unlisted products are unsupported. There is no GUI
+integration or configuration migration in this milestone.
+
+Reads are bounded to 1 MiB per metadata file, 64 MiB of TOCs per discovery,
+10,000 build rows or addon entries per product, and 64 build-info columns.
+Links and Windows reparse points are rejected when inspected. Discovery is a
+read-only snapshot; concurrent filesystem changes can invalidate it. Never use
+this report as authorization for later filesystem writes without revalidation.
+Offline fixtures cover copied Windows, macOS and Wine/Linux layouts, malformed
+and ambiguous metadata, read limits, links and unchanged legacy configuration.
+Executing those fixtures on Windows does not verify native macOS or Linux support.
