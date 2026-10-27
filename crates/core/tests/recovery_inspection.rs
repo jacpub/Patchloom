@@ -17,7 +17,9 @@ fn command_reports_retained_versions_and_rejects_bad_journal_without_writes() {
     };
     let clean = inspect(&root);
     assert!(clean.status.success());
-    assert!(String::from_utf8(clean.stdout).unwrap().contains("phase: none"));
+    assert!(String::from_utf8(clean.stdout)
+        .unwrap()
+        .contains("phase: none"));
     assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
 
     let transaction = root.join(".patchloom-install");
@@ -39,7 +41,13 @@ fn command_reports_retained_versions_and_rejects_bad_journal_without_writes() {
     fs::write(transaction.join("plan.yml"), b"version: [invalid").unwrap();
     assert!(!inspect(&root).status.success());
     assert_eq!(fs::read(root.join("Foo/new.lua")).unwrap(), b"replacement");
-    assert_eq!(fs::read(transaction.join("backup/Foo/old.lua")).unwrap(), b"original");
-    assert_eq!(fs::read(transaction.join("plan.yml")).unwrap(), b"version: [invalid");
+    assert_eq!(
+        fs::read(transaction.join("backup/Foo/old.lua")).unwrap(),
+        b"original"
+    );
+    assert_eq!(
+        fs::read(transaction.join("plan.yml")).unwrap(),
+        b"version: [invalid"
+    );
     assert!(!temp.path().join("unused-config").exists());
 }
