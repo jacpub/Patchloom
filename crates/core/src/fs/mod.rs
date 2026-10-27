@@ -15,6 +15,8 @@ mod save;
 mod theme;
 
 pub use addon::{delete_addons, delete_saved_variables};
+pub(crate) use install::component as validate_component;
+pub(crate) use install::install_addon_checked;
 pub use install::{inspect_recovery, install_addon, restore_originals, RecoveryInspection};
 pub use save::PersistentData;
 #[cfg(feature = "gui")]

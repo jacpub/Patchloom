@@ -37,7 +37,7 @@ fn invalid(message: impl Into<String>) -> io::Error {
 }
 
 // Use the same portable spelling rules on all platforms, including Windows ADS/devices.
-fn component(name: &str) -> io::Result<()> {
+pub(crate) fn component(name: &str) -> io::Result<()> {
     let device = name
         .split('.')
         .next()
@@ -911,6 +911,15 @@ pub async fn install_addon(
     from_directory: &Path,
     to_directory: &Path,
 ) -> Result<Vec<AddonFolder>> {
+    install_addon_checked(addon, from_directory, to_directory, |_, addons| Ok(addons)).await
+}
+
+pub(crate) async fn install_addon_checked(
+    addon: &Addon,
+    from_directory: &Path,
+    to_directory: &Path,
+    validate_staged: impl FnOnce(&Path, Vec<AddonFolder>) -> Result<Vec<AddonFolder>>,
+) -> Result<Vec<AddonFolder>> {
     component(&addon.primary_folder_id)?;
     let zip_path = from_directory.join(&addon.primary_folder_id);
     let zip_file = File::open(&zip_path)?;
@@ -950,6 +959,7 @@ pub async fn install_addon(
         journal.sync_all()?;
         fs::create_dir(transaction.join("backup"))?;
         let addons = stage(&mut archive, &transaction.join("staged"), &plan.incoming)?;
+        let addons = validate_staged(&transaction.join("staged"), addons)?;
         File::create_new(transaction.join("ready"))?.sync_all()?;
         Ok(addons)
     })();

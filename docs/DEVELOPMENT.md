@@ -186,3 +186,59 @@ this report as authorization for later filesystem writes without revalidation.
 Offline fixtures cover copied Windows, macOS and Wine/Linux layouts, malformed
 and ambiguous metadata, read limits, links and unchanged legacy configuration.
 Executing those fixtures on Windows does not verify native macOS or Linux support.
+
+## GitHub provider pilot
+
+`check_github <owner/repository> <copied-WoW-root> <product-id>` previews a
+stable public release without loading application configuration or installing it.
+The pilot requires a unique `release.json` match for the selected modern product
+and exact interface, a packaged ZIP, and GitHub SHA-256 digests. Missing or
+ambiguous metadata is an error. It does not guess from filenames or fall back
+across products, release channels or providers.
+
+Downloads require HTTPS without URL credentials. Redirects stay on the same
+origin, with GitHub release downloads also allowed to reach
+`release-assets.githubusercontent.com`. There are at most five redirects and a
+120-second timeout per download request (30 seconds for metadata). Metadata is
+limited to 1 MiB and archives to 128 MiB. HTTP errors, encoded bodies, incomplete
+streams and size or digest mismatches fail before publication. The downloader
+uses an owned temporary file and never replaces an existing download. A forced
+process stop can leave an unpublished temporary file; retry preserves it.
+This also hardens the shared legacy addon download path. Unverified providers
+with other redirect conventions may now report an error and need contract review.
+
+The library pilot can update a disposable copied installation through the staged
+installer. It rechecks installation identity after downloading and validates all
+staged addon TOCs before replacing folders. Returned metadata comes from the
+selected product TOC. Callers must explicitly supply previously owned folders;
+discovery does not establish repository ownership. The returned receipt is in
+memory, and `matches_release` compares that receipt with remote metadata. It
+does not verify later changes on disk. Persistent ownership, GUI integration and
+the recovery cleanup flow are still required before public beta.
+
+The SHA-256 implementation uses `sha2` 0.10.9 and seven new locked crypto
+packages including `sha2`. Its CPU-detection dependency requires a newer `libc`,
+which moves from 0.2.98 to 0.2.191. Other existing dependency versions and the
+lockfile format are preserved. The already locked `tempfile` package is now a
+runtime dependency as well as the source of disposable test fixtures.
+
+On 2026-10-27, an explicit unauthenticated probe through the Rust adapter checked
+the public BigWigs v427.8 metadata and manifest, then verified its 4,635,969-byte
+ZIP against the API digest. The ZIP was only read, never installed or executed.
+This establishes a download contract for that observed release, not compatibility
+or coverage of every repository. The probe is ignored during normal tests and
+requires `PATCHLOOM_PUBLIC_GITHUB_PROBE=1` when explicitly invoked.
+GitHub documents public unauthenticated reads with a 60-request/hour primary
+limit per originating IP. The adapter makes no automatic retries on HTTP errors;
+callers must respect rate-limit responses before requesting again. See GitHub's
+[rate-limit documentation](https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api)
+and the [packager manifest source](https://github.com/BigWigsMods/packager/blob/master/release.sh).
+
+Offline fixtures cover the selected-product update/recheck loop, incompatible
+and malicious ZIPs, HTTP failures, truncation, byte limits, timeouts, redirects,
+digest failures, links, destination races, cancellation and forced interruption.
+Existing installer rollback and process-interruption fixtures remain in the
+suite. These checks use disposable data; they do not certify live updates,
+power-loss durability, hostile concurrent filesystem writers or native macOS
+behavior. The old Ajour application self-update helper remains disabled through
+`no-self-update` and is outside this addon-download pilot.

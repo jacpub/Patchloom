@@ -6,6 +6,7 @@ pub mod config;
 pub mod discovery;
 pub mod error;
 pub mod fs;
+pub mod github_releases;
 pub mod murmur2;
 pub mod network;
 pub mod parse;

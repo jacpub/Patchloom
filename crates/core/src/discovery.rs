@@ -269,6 +269,39 @@ fn addon_toc(
     })
 }
 
+/// Parse metadata from the uniquely selected product TOCs before staged publication.
+pub(crate) fn parse_product_tocs(
+    root: &Path,
+    product: Product,
+    interface: u32,
+) -> io::Result<Vec<crate::addon::AddonFolder>> {
+    let mut budget = 64 * MAX_METADATA;
+    let mut addons = vec![];
+    for (index, entry) in fs::read_dir(root)?.enumerate() {
+        if index >= MAX_FOLDERS {
+            return Err(invalid("Too many staged addon folders"));
+        }
+        let entry = entry?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| invalid("Non-UTF-8 addon folder"))?;
+        let toc = addon_toc(&entry.path(), product, interface, &name, &mut budget)?;
+        if let Some(issue) = toc.issue {
+            return Err(invalid(format!("{name}: {issue}")));
+        }
+        let path = toc
+            .selected
+            .ok_or_else(|| invalid("Missing selected TOC"))?;
+        addons.push(
+            crate::parse::parse_toc_path(&path)
+                .ok_or_else(|| invalid("Selected TOC is unreadable"))?,
+        );
+    }
+    addons.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(addons)
+}
+
 /// Inventory a caller-supplied copied installation root. No configuration getters or writes.
 pub fn discover(root: &Path) -> io::Result<Discovery> {
     plain(root, true)?;
