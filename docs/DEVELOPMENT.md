@@ -84,4 +84,3 @@ before enabling an integration.
 
 Follow the [brand and public-copy guidance](BRAND_DIRECTION.md) for all
 Patchloom text and visuals.
-
