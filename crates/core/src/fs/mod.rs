@@ -15,7 +15,7 @@ mod save;
 mod theme;
 
 pub use addon::{delete_addons, delete_saved_variables};
-pub use install::{inspect_recovery, install_addon, RecoveryInspection};
+pub use install::{inspect_recovery, install_addon, restore_originals, RecoveryInspection};
 pub use save::PersistentData;
 #[cfg(feature = "gui")]
 pub use theme::{import_theme, load_user_themes};

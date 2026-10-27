@@ -65,6 +65,15 @@ pub(super) fn checkpoint(root: &Path, phase: &str) {
 fn child_process_entry() {
     let root = guarded_root();
     let action = std::env::var("PATCHLOOM_PROCESS_ACTION").unwrap();
+    if action == "restore" || action == "restore-blocked" {
+        let result = restore_originals(&root, |_, _| true);
+        if action == "restore-blocked" {
+            assert!(result.is_err());
+        } else {
+            result.unwrap();
+        }
+        return;
+    }
     if action.starts_with("recover") {
         let lock = File::options()
             .read(true)
@@ -257,6 +266,63 @@ fn cross_process_contention_and_lock_release_after_forced_stop() {
     assert_eq!(fs::read(root.join("Foo/new.lua")).unwrap(), b"new");
     assert_eq!(fs::read(root.join("Unrelated/keep.lua")).unwrap(), b"keep");
     assert!(!root.join(TRANSACTION).exists());
+}
+
+#[test]
+fn explicit_restore_resumes_after_forced_stop_without_losing_versions() {
+    for phase in ["restore-retained", "restore-original"] {
+        let (_temp, root) = fixture();
+        let mut installer = Process::start(&root, "interrupted-install", "install", "published");
+        installer.paused("published");
+        installer.stop();
+        let transaction = root.join(TRANSACTION);
+        let mut plan = read_plan(&transaction).unwrap();
+        plan.previous.push("Bar".into());
+        plan.incoming.push("Bar".into());
+        fs::write(
+            transaction.join("plan.yml"),
+            serde_yaml::to_string(&plan).unwrap(),
+        )
+        .unwrap();
+        fs::create_dir(transaction.join("backup/Bar")).unwrap();
+        fs::write(transaction.join("backup/Bar/old.lua"), b"original-bar").unwrap();
+        fs::create_dir(root.join("Bar")).unwrap();
+        fs::write(root.join("Bar/new.lua"), b"new-bar").unwrap();
+        let mut restore = Process::start(&root, "interrupted-restore", "restore", phase);
+        restore.paused(phase);
+        restore.stop();
+        Process::start(
+            &root,
+            "resume-restore",
+            if phase == "restore-retained" {
+                "restore"
+            } else {
+                "restore-blocked"
+            },
+            "",
+        )
+        .success();
+        assert_eq!(fs::read(root.join("Foo/old.lua")).unwrap(), b"original");
+        if phase == "restore-retained" {
+            assert_eq!(fs::read(root.join("Bar/old.lua")).unwrap(), b"original-bar");
+        } else {
+            assert!(!root.join("Bar").exists());
+            assert_eq!(
+                fs::read(transaction.join("backup/Bar/old.lua")).unwrap(),
+                b"original-bar"
+            );
+        }
+        assert_eq!(
+            fs::read(root.join(RESTORE).join("backup/Bar/new.lua")).unwrap(),
+            b"new-bar"
+        );
+        assert_eq!(
+            fs::read(root.join(RESTORE).join("backup/Foo/new.lua")).unwrap(),
+            b"new"
+        );
+        assert_eq!(fs::read(root.join("Unrelated/keep.lua")).unwrap(), b"keep");
+        assert!(recover(&root).is_err());
+    }
 }
 
 #[test]

@@ -1,5 +1,32 @@
 # Patchloom developer notes
 
+## Restoring a retained original bundle
+
+The standalone `restore_originals` command previews the original bundle and
+affected current folders while holding the existing installer lock. Type
+`RESTORE` to select the originals; any other response cancels without changing
+addon folders. Use only disposable fixtures during development.
+
+```sh
+cargo run -p ajour-core --bin restore_originals --locked \
+  --features no-self-update -- <fixture-AddOns-directory>
+```
+
+Recovery requires a valid interrupted-install journal and every original backup.
+Current folders move into `.patchloom-restore/backup` before originals return to
+AddOns. Replacement versions and both journals remain intact. Interrupted
+replacement retention can resume after confirming a fresh preview. If any
+original has already moved back, recovery stops for inspection instead of
+guessing that an occupied destination is the original. Automatic resume after
+partial original restoration needs additional source-provenance validation.
+Conflicts, missing originals, links and busy locks stop the operation.
+
+Updates stay blocked until explicit cleanup is implemented and reviewed. This
+command does not choose the replacement version, recover an incomplete recovery
+preparation, or certify power-loss durability. It never starts the GUI or reads
+application configuration. A coherent hostile writer remains outside the
+cooperating-process guarantee.
+
 ## Inspecting an interrupted install
 
 The standalone `inspect_recovery` command reads a supplied AddOns fixture and

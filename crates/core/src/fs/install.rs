@@ -15,6 +15,7 @@ use walkdir::WalkDir;
 
 const TRANSACTION: &str = ".patchloom-install";
 const LOCK: &str = ".patchloom-install.lock";
+const RESTORE: &str = ".patchloom-restore";
 const MAX_ENTRIES: usize = 10_000;
 const MAX_FILE: u64 = 128 * 1024 * 1024;
 const MAX_TOTAL: u64 = 512 * 1024 * 1024;
@@ -23,7 +24,7 @@ const MAX_TOTAL: u64 = 512 * 1024 * 1024;
 #[cfg(all(test, windows, feature = "no-self-update"))]
 mod process_tests;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Plan {
     version: u8,
@@ -456,6 +457,8 @@ pub struct RecoveryInspection {
     pub backups: Vec<String>,
     pub staged: Vec<String>,
     pub destinations: Vec<String>,
+    pub restore_phase: Option<String>,
+    pub retained_replacements: Vec<String>,
 }
 
 /// Inspect retained installation state without creating or changing any files.
@@ -486,9 +489,17 @@ pub fn inspect_recovery(directory: &Path) -> Result<RecoveryInspection> {
         backups: vec![],
         staged: vec![],
         destinations: vec![],
+        restore_phase: None,
+        retained_replacements: vec![],
     };
     let transaction = root.join(TRANSACTION);
     if !exists(&transaction)? {
+        if exists(&root.join(RESTORE))? {
+            return Err(invalid(
+                "Orphaned recovery workspace retained; install journal is missing",
+            )
+            .into());
+        }
         return Ok(report);
     }
     plain_tree(&transaction)?;
@@ -525,6 +536,27 @@ pub fn inspect_recovery(directory: &Path) -> Result<RecoveryInspection> {
     }
     report.previous = plan.previous;
     report.incoming = plan.incoming;
+    let workspace = root.join(RESTORE);
+    if exists(&workspace)? {
+        plain_tree(&workspace)?;
+        let restore = read_plan(&workspace)?;
+        validate_transaction(&workspace, &restore)?;
+        report.restore_phase = Some(
+            if marker(&workspace.join("committed"))? {
+                "restoring-or-restored"
+            } else if marker(&workspace.join("ready"))? {
+                "retaining-current"
+            } else {
+                "incomplete-preparation"
+            }
+            .into(),
+        );
+        for name in restore.previous {
+            if exists(&workspace.join("backup").join(&name))? {
+                report.retained_replacements.push(name);
+            }
+        }
+    }
     Ok(report)
 }
 
@@ -563,8 +595,213 @@ fn read_plan(transaction: &Path) -> Result<Plan> {
     Ok(plan)
 }
 
+fn validate_restore_state(
+    root: &Path,
+    transaction: &Path,
+    workspace: &Path,
+    original: &Plan,
+    plan: &Plan,
+    resuming: bool,
+    restoring: bool,
+) -> Result<()> {
+    if is_link(&fs::symlink_metadata(root)?) {
+        return Err(invalid("Recovery root changed; all versions retained").into());
+    }
+    plain_tree(transaction)?;
+    if read_plan(transaction)? != *original {
+        return Err(invalid("Install journal changed; review recovery again").into());
+    }
+    validate_transaction(transaction, original)?;
+    if !marker(&transaction.join("ready"))? || exists(workspace)? != resuming {
+        return Err(invalid("Recovery state changed; review recovery again").into());
+    }
+    if resuming {
+        plain_tree(workspace)?;
+        if read_plan(workspace)? != *plan {
+            return Err(invalid("Recovery journal changed; all versions retained").into());
+        }
+        validate_transaction(workspace, plan)?;
+        if marker(&workspace.join("committed"))? != restoring
+            || marker(&workspace.join("ready"))? == restoring
+        {
+            return Err(invalid("Recovery phase changed; all versions retained").into());
+        }
+    }
+    // Validate every source and destination before any move. Never guess at missing originals.
+    for name in &plan.previous {
+        for path in [root.join(name), workspace.join("backup").join(name)] {
+            if exists(&path)? {
+                if !path.is_dir() {
+                    return Err(invalid("Recovery path is not a folder").into());
+                }
+                plain_tree(&path)?;
+            }
+        }
+        if !restoring && exists(&root.join(name))? && exists(&workspace.join("backup").join(name))?
+        {
+            return Err(invalid("Recovery destination conflict; all versions retained").into());
+        }
+    }
+    for name in &plan.incoming {
+        let backup = transaction.join("backup").join(name);
+        if exists(&backup)? {
+            if !backup.is_dir() {
+                return Err(invalid("Original backup is not a folder").into());
+            }
+            plain_tree(&backup)?;
+            if restoring && exists(&root.join(name))? {
+                return Err(
+                    invalid("Restore destination occupied; original backup retained").into(),
+                );
+            }
+        } else {
+            return Err(invalid("Original backup missing; all versions retained").into());
+        }
+    }
+    Ok(())
+}
+
+/// Restore the complete original bundle after an explicit, locked preview.
+/// Current destinations are moved aside, never deleted. Retained state blocks updates.
+pub fn restore_originals(
+    directory: &Path,
+    confirm: impl FnOnce(&[String], &[String]) -> bool,
+) -> Result<bool> {
+    if is_link(&fs::symlink_metadata(directory)?) || !directory.is_dir() {
+        return Err(invalid("AddOns root must be an existing directory, not a link").into());
+    }
+    let root = directory.canonicalize()?;
+    let lock_path = root.join(LOCK);
+    let metadata = fs::symlink_metadata(&lock_path)?;
+    if is_link(&metadata) || !metadata.is_file() {
+        return Err(invalid("Invalid install lock file").into());
+    }
+    let lock = File::options().read(true).write(true).open(lock_path)?;
+    lock.try_lock()
+        .map_err(|_| invalid("Installation is busy; retry recovery later"))?;
+    let transaction = root.join(TRANSACTION);
+    plain_tree(&transaction)?;
+    let original = read_plan(&transaction)?;
+    validate_transaction(&transaction, &original)?;
+    if original.previous.is_empty() || !marker(&transaction.join("ready"))? {
+        return Err(invalid("No interrupted original bundle is available to restore").into());
+    }
+    let workspace = root.join(RESTORE);
+    let names: Vec<String> = original
+        .previous
+        .iter()
+        .chain(&original.incoming)
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let plan = Plan {
+        version: 1,
+        previous: names,
+        incoming: original.previous.clone(),
+    };
+    let resuming = exists(&workspace)?;
+    let restoring = if resuming {
+        plain_tree(&workspace)?;
+        let saved = read_plan(&workspace)?;
+        if saved.previous != plan.previous || saved.incoming != plan.incoming {
+            return Err(invalid("Recovery plan changed; all versions retained").into());
+        }
+        validate_transaction(&workspace, &plan)?;
+        if !marker(&workspace.join("ready"))? && !marker(&workspace.join("committed"))? {
+            return Err(invalid("Incomplete recovery preparation; all versions retained").into());
+        }
+        marker(&workspace.join("committed"))?
+    } else {
+        false
+    };
+    validate_restore_state(
+        &root,
+        &transaction,
+        &workspace,
+        &original,
+        &plan,
+        resuming,
+        restoring,
+    )?;
+    if !confirm(&plan.incoming, &plan.previous) {
+        return Ok(false);
+    }
+    validate_restore_state(
+        &root,
+        &transaction,
+        &workspace,
+        &original,
+        &plan,
+        resuming,
+        restoring,
+    )?;
+    if !resuming {
+        fs::create_dir(&workspace)?;
+        let file = File::create_new(workspace.join("plan.yml"))?;
+        serde_yaml::to_writer(&file, &plan)?;
+        file.sync_all()?;
+        fs::create_dir(workspace.join("backup"))?;
+        fs::create_dir(workspace.join("staged"))?;
+        File::create_new(workspace.join("ready"))?.sync_all()?;
+    }
+    if !restoring {
+        for name in &plan.previous {
+            let current = root.join(name);
+            if exists(&current)? {
+                if !current.is_dir() {
+                    return Err(
+                        invalid("Current folder type changed; all versions retained").into(),
+                    );
+                }
+                let retained = workspace.join("backup").join(name);
+                if exists(&retained)? {
+                    return Err(
+                        invalid("Retention destination changed; all versions retained").into(),
+                    );
+                }
+                plain_tree(&current)?;
+                fs::rename(current, retained)?;
+                #[cfg(all(test, windows, feature = "no-self-update"))]
+                process_tests::checkpoint(&root, "restore-retained");
+            }
+        }
+        fs::rename(workspace.join("ready"), workspace.join("committed"))?;
+    }
+    for name in &plan.incoming {
+        let backup = transaction.join("backup").join(name);
+        if !exists(&backup)? {
+            return Err(invalid(
+                "Original source changed; inspect retained versions before continuing",
+            )
+            .into());
+        }
+        if !backup.is_dir() {
+            return Err(invalid("Original folder type changed; all versions retained").into());
+        }
+        {
+            if exists(&root.join(name))? {
+                return Err(
+                    invalid("Restore destination occupied; original backup retained").into(),
+                );
+            }
+            plain_tree(&backup)?;
+            fs::rename(backup, root.join(name))?;
+            #[cfg(all(test, windows, feature = "no-self-update"))]
+            process_tests::checkpoint(&root, "restore-original");
+        }
+    }
+    // Deliberately retain the journal and replacement folders until cleanup is explicitly reviewed.
+    Ok(true)
+}
+
 // Restart recovery never deletes an AddOns destination based on journal claims alone.
 fn recover(root: &Path) -> Result<()> {
+    if exists(&root.join(RESTORE))? {
+        return Err(
+            invalid("Restored versions retained; explicit recovery cleanup is required").into(),
+        );
+    }
     let transaction = root.join(TRANSACTION);
     if !exists(&transaction)? {
         return Ok(());
@@ -790,6 +1027,187 @@ mod tests {
         fs::create_dir(transaction.join("committed")).unwrap();
         assert!(inspect_recovery(&root).is_err());
         assert!(transaction.join("backup/Foo/old.lua").exists());
+    }
+
+    fn restore_fixture() -> (TempDir, PathBuf, PathBuf) {
+        let (temp, _addon, _downloads, root) = fixture();
+        File::create(root.join(LOCK)).unwrap();
+        let transaction = pending(
+            &root,
+            &Plan {
+                version: 1,
+                previous: vec!["Foo".into()],
+                incoming: vec!["Foo".into()],
+            },
+        );
+        fs::rename(root.join("Foo"), transaction.join("backup/Foo")).unwrap();
+        fs::create_dir(root.join("Foo")).unwrap();
+        fs::write(root.join("Foo/new.lua"), b"replacement").unwrap();
+        (temp, root, transaction)
+    }
+
+    #[test]
+    fn restore_revalidates_source_and_journal_after_confirmation() {
+        for change_journal in [false, true] {
+            let (temp, root, transaction) = restore_fixture();
+            let result = restore_originals(&root, |_, _| {
+                if change_journal {
+                    fs::write(
+                        transaction.join("plan.yml"),
+                        b"version: 99\nprevious: [Foo]\nincoming: [Foo]\n",
+                    )
+                    .unwrap();
+                } else {
+                    fs::rename(
+                        transaction.join("backup/Foo"),
+                        temp.path().join("moved-original"),
+                    )
+                    .unwrap();
+                }
+                true
+            });
+            assert!(result.is_err());
+            assert_eq!(fs::read(root.join("Foo/new.lua")).unwrap(), b"replacement");
+            assert!(!root.join(RESTORE).exists());
+            let original = if change_journal {
+                transaction.join("backup/Foo/old.lua")
+            } else {
+                temp.path().join("moved-original/old.lua")
+            };
+            assert_eq!(fs::read(original).unwrap(), b"original");
+        }
+    }
+
+    #[test]
+    fn restore_never_accepts_unverified_destination_as_original() {
+        let (temp, root, transaction) = restore_fixture();
+        fs::rename(
+            transaction.join("backup/Foo"),
+            temp.path().join("moved-original"),
+        )
+        .unwrap();
+        let workspace = root.join(RESTORE);
+        fs::create_dir_all(workspace.join("backup/Foo")).unwrap();
+        fs::create_dir(workspace.join("staged")).unwrap();
+        fs::copy(transaction.join("plan.yml"), workspace.join("plan.yml")).unwrap();
+        fs::write(workspace.join("committed"), b"").unwrap();
+        fs::write(workspace.join("backup/Foo/new.lua"), b"retained").unwrap();
+        assert!(restore_originals(&root, |_, _| panic!(
+            "missing originals must not be offered"
+        ))
+        .is_err());
+        assert_eq!(fs::read(root.join("Foo/new.lua")).unwrap(), b"replacement");
+        assert_eq!(
+            fs::read(workspace.join("backup/Foo/new.lua")).unwrap(),
+            b"retained"
+        );
+    }
+
+    #[test]
+    fn inspection_reports_orphaned_restore_workspace_as_error() {
+        let (_temp, _addon, _downloads, root) = fixture();
+        let retained = root.join(RESTORE).join("backup/Foo");
+        fs::create_dir_all(&retained).unwrap();
+        fs::write(retained.join("new.lua"), b"retained").unwrap();
+        assert!(inspect_recovery(&root).is_err());
+        assert_eq!(fs::read(retained.join("new.lua")).unwrap(), b"retained");
+    }
+
+    #[test]
+    fn explicit_restore_preserves_versions_and_can_resume() {
+        let (_temp, _addon, _downloads, root) = fixture();
+        File::create(root.join(LOCK)).unwrap();
+        let transaction = pending(
+            &root,
+            &Plan {
+                version: 1,
+                previous: vec!["Foo".into()],
+                incoming: vec!["Foo".into(), "New".into()],
+            },
+        );
+        fs::rename(root.join("Foo"), transaction.join("backup/Foo")).unwrap();
+        fs::create_dir(root.join("Foo")).unwrap();
+        fs::write(root.join("Foo/new.lua"), b"replacement").unwrap();
+        fs::create_dir(root.join("New")).unwrap();
+        fs::write(root.join("New/new.lua"), b"additional").unwrap();
+        assert!(!restore_originals(&root, |_, _| false).unwrap());
+        assert!(!root.join(RESTORE).exists());
+        assert!(root.join("Foo/new.lua").exists());
+        assert!(restore_originals(&root, |originals, _| originals == ["Foo"]).unwrap());
+        assert_eq!(fs::read(root.join("Foo/old.lua")).unwrap(), b"original");
+        assert_eq!(
+            fs::read(root.join(RESTORE).join("backup/Foo/new.lua")).unwrap(),
+            b"replacement"
+        );
+        assert_eq!(
+            fs::read(root.join(RESTORE).join("backup/New/new.lua")).unwrap(),
+            b"additional"
+        );
+        assert!(!root.join("New").exists());
+        assert!(restore_originals(&root, |_, _| true).is_err());
+        let inspection = inspect_recovery(&root).unwrap();
+        assert_eq!(
+            inspection.restore_phase.as_deref(),
+            Some("restoring-or-restored")
+        );
+        assert_eq!(inspection.retained_replacements, ["Foo", "New"]);
+        assert!(recover(&root).is_err());
+    }
+
+    #[test]
+    fn explicit_restore_refuses_missing_originals_before_confirmation() {
+        let (_temp, _addon, _downloads, root) = fixture();
+        File::create(root.join(LOCK)).unwrap();
+        pending(
+            &root,
+            &Plan {
+                version: 1,
+                previous: vec!["Foo".into()],
+                incoming: vec!["Foo".into()],
+            },
+        );
+        assert!(
+            restore_originals(&root, |_, _| panic!("invalid state must not be offered")).is_err()
+        );
+        assert!(!root.join(RESTORE).exists());
+        assert_eq!(fs::read(root.join("Foo/old.lua")).unwrap(), b"original");
+    }
+
+    #[test]
+    fn explicit_restore_rejects_busy_and_conflicting_state_without_overwrite() {
+        let (_temp, _addon, _downloads, root) = fixture();
+        let lock = File::create(root.join(LOCK)).unwrap();
+        lock.lock().unwrap();
+        assert!(restore_originals(&root, |_, _| panic!("busy state")).is_err());
+        drop(lock);
+        let plan = Plan {
+            version: 1,
+            previous: vec!["Foo".into()],
+            incoming: vec!["Foo".into()],
+        };
+        let transaction = pending(&root, &plan);
+        fs::create_dir(transaction.join("backup/Foo")).unwrap();
+        fs::write(transaction.join("backup/Foo/old.lua"), b"backup").unwrap();
+        let workspace = root.join(RESTORE);
+        fs::create_dir_all(workspace.join("backup/Foo")).unwrap();
+        fs::create_dir(workspace.join("staged")).unwrap();
+        fs::write(
+            workspace.join("plan.yml"),
+            serde_yaml::to_string(&plan).unwrap(),
+        )
+        .unwrap();
+        fs::write(workspace.join("ready"), b"").unwrap();
+        fs::write(workspace.join("backup/Foo/retained.lua"), b"retained").unwrap();
+        assert!(restore_originals(&root, |_, _| panic!("conflict must not be offered")).is_err());
+        assert_eq!(fs::read(root.join("Foo/old.lua")).unwrap(), b"original");
+        assert_eq!(
+            fs::read(transaction.join("backup/Foo/old.lua")).unwrap(),
+            b"backup"
+        );
+        assert_eq!(
+            fs::read(workspace.join("backup/Foo/retained.lua")).unwrap(),
+            b"retained"
+        );
     }
 
     #[test]
