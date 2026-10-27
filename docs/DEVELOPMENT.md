@@ -218,7 +218,10 @@ the recovery cleanup flow are still required before public beta.
 
 The SHA-256 implementation uses `sha2` 0.10.9 and seven new locked crypto
 packages including `sha2`. Its CPU-detection dependency requires a newer `libc`,
-which moves from 0.2.98 to 0.2.191. Other existing dependency versions and the
+which is pinned to 0.2.155, up from 0.2.98. This meets the CPU-detection
+minimum and retains the deprecated Linux `ENOATTR` alias used by locked
+`xattr` 0.2.2; newer `libc` removed that alias and failed Linux compilation.
+Other existing dependency versions and the
 lockfile format are preserved. The already locked `tempfile` package is now a
 runtime dependency as well as the source of disposable test fixtures.
 
