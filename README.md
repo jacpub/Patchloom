@@ -1,5 +1,7 @@
 # Patchloom
 
+![Patchloom's Arcane Weave P and an enchanted loom][patchloom-art]
+
 Patchloom is a World of Warcraft addon download and update manager built from
 [Ajour](https://github.com/ajour/ajour). Planned releases target Windows, macOS
 and Linux.
@@ -30,3 +32,5 @@ Original artwork credits remain:
 ## License
 
 Patchloom continues Ajour under the [GNU GPL version 3](LICENSE).
+
+[patchloom-art]: resources/screenshots/patchloom-readme-illustration.jpg
