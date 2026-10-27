@@ -80,7 +80,7 @@ pub(crate) fn component(name: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn folder_name(name: &str) -> io::Result<()> {
+pub(super) fn folder_name(name: &str) -> io::Result<()> {
     component(name)?;
     if name.to_lowercase().starts_with(".patchloom")
         || matches!(name.to_ascii_lowercase().as_str(), "wtf" | "savedvariables")
@@ -90,7 +90,7 @@ fn folder_name(name: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn is_link(metadata: &fs::Metadata) -> bool {
+pub(super) fn is_link(metadata: &fs::Metadata) -> bool {
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
@@ -345,6 +345,17 @@ fn validate_transaction(transaction: &Path, plan: &Plan) -> Result<()> {
                     return Err(invalid("Invalid install journal file").into());
                 }
             }
+            "receipt.json" | "receipt.id" => {
+                let metadata = entry.metadata()?;
+                if !metadata.is_file()
+                    || metadata.len() > 1024 * 1024
+                    || (name == "receipt.id" && metadata.len() != 64)
+                {
+                    return Err(
+                        invalid("Invalid ownership journal metadata; state retained").into(),
+                    );
+                }
+            }
             "ready" | "committed" => {
                 marker(&entry.path())?;
             }
@@ -399,7 +410,13 @@ fn cleanup_transaction(transaction: &Path, plan: &Plan) -> Result<()> {
             }
         }
     }
-    for child in ["ready", "committed", "plan.yml"] {
+    for child in [
+        "ready",
+        "committed",
+        "receipt.json",
+        "receipt.id",
+        "plan.yml",
+    ] {
         let path = transaction.join(child);
         if exists(&path)? {
             fs::remove_file(path)?;
@@ -854,6 +871,11 @@ fn recover(root: &Path) -> Result<()> {
                 .into());
             }
         }
+        #[cfg(all(test, windows, feature = "no-self-update"))]
+        process_tests::checkpoint(root, "ownership_pending");
+        super::ownership::publish(root, &transaction, &plan.incoming)?;
+        #[cfg(all(test, windows, feature = "no-self-update"))]
+        process_tests::checkpoint(root, "ownership_published");
     } else if exists(&backups)? && fs::read_dir(&backups)?.next().is_some() {
         return Err(invalid("Unrecognized install state; backups retained").into());
     }
@@ -898,7 +920,12 @@ fn finish(root: &Path, plan: &Plan) -> Result<()> {
         }
         return Err(error);
     }
+    let managed = exists(&root.join(TRANSACTION).join("receipt.id"))?
+        || exists(&root.join(TRANSACTION).join("receipt.json"))?;
     if let Err(error) = recover(root) {
+        if managed {
+            return Err(invalid(format!("Addon committed; ownership publication or cleanup pending: {error}. Inspect retained state before retrying")).into());
+        }
         log::warn!("Addon installed; transaction cleanup pending: {}", error);
     }
     Ok(())
@@ -1006,6 +1033,58 @@ mod tests {
             ..Default::default()
         });
         (temp, addon, downloads, root)
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn managed_cleanup_failure_after_receipt_journal_removal_reports_pending() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let (_temp, addon, downloads, root) = fixture();
+        archive(
+            &downloads.join("Foo"),
+            &[
+                ("Foo/Foo.toc", b"## Interface: 120105"),
+                ("Foo/new.lua", b"new"),
+            ],
+        );
+        let mut held_plan = None;
+        let result = async_std::task::block_on(install_addon_checked(
+            &addon,
+            &downloads,
+            &root,
+            |staged, folders| {
+                crate::fs::ownership::prepare(
+                    staged,
+                    &root,
+                    serde_json::json!({"repository":"fixture/addon","product":"Retail"}),
+                )?;
+                held_plan = Some(
+                    File::options()
+                        .read(true)
+                        .share_mode(3)
+                        .open(staged.parent().unwrap().join("plan.yml"))?,
+                );
+                Ok(folders)
+            },
+        ));
+        assert!(result.unwrap_err().to_string().contains("Addon committed"));
+        assert!(root.join(TRANSACTION).join("plan.yml").exists());
+        assert!(
+            !root.join(TRANSACTION).join("receipt.id").exists(),
+            "failure occurs after receipt journal cleanup"
+        );
+        assert_eq!(fs::read(root.join("Foo/new.lua")).unwrap(), b"new");
+        assert_eq!(
+            fs::read_dir(root.join(".patchloom-ownership"))
+                .unwrap()
+                .count(),
+            1
+        );
+        drop(held_plan);
+        let lock = File::open(root.join(LOCK)).unwrap();
+        lock.try_lock().unwrap();
+        recover(&root).unwrap();
+        assert!(!root.join(TRANSACTION).exists());
     }
 
     #[test]

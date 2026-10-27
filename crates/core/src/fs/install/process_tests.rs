@@ -103,9 +103,25 @@ fn child_process_entry() {
         ..Default::default()
     });
     let downloads = root.parent().unwrap().join("downloads");
-    let result = async_std::task::block_on(install_addon(&addon, &downloads, &root));
+    let result = if action == "install-owned" {
+        async_std::task::block_on(install_addon_checked(
+            &addon,
+            &downloads,
+            &root,
+            |staged, folders| {
+                crate::fs::ownership::prepare(
+                    staged,
+                    &root,
+                    serde_json::json!({"repository":"fixture/addon","product":"Retail"}),
+                )?;
+                Ok(folders)
+            },
+        ))
+    } else {
+        async_std::task::block_on(install_addon(&addon, &downloads, &root))
+    };
     match action.as_str() {
-        "install" => {
+        "install" | "install-owned" => {
             result.unwrap();
         }
         "install-busy" => assert!(result
@@ -266,6 +282,44 @@ fn cross_process_contention_and_lock_release_after_forced_stop() {
     assert_eq!(fs::read(root.join("Foo/new.lua")).unwrap(), b"new");
     assert_eq!(fs::read(root.join("Unrelated/keep.lua")).unwrap(), b"keep");
     assert!(!root.join(TRANSACTION).exists());
+}
+
+#[test]
+fn ownership_publication_survives_forced_stop_before_backup_cleanup() {
+    for phase in ["committed", "ownership_published", "cleanup_backup"] {
+        let (_temp, root) = fixture();
+        let mut installer = Process::start(&root, "owned", "install-owned", phase);
+        installer.paused(phase);
+        let id = fs::read_to_string(root.join(TRANSACTION).join("receipt.id")).unwrap();
+        if phase == "committed" {
+            assert!(root.join(TRANSACTION).join("backup/Foo/old.lua").exists());
+        }
+        installer.stop();
+        Process::start(&root, "recover-owned", "recover-ok", "").success();
+        let preview = crate::fs::inspect_ownership(&root, &id).unwrap();
+        assert_eq!(preview.folders, ["Foo"]);
+        assert_eq!(fs::read(root.join("Foo/new.lua")).unwrap(), b"new");
+        assert_eq!(fs::read(root.join("Unrelated/keep.lua")).unwrap(), b"keep");
+        assert!(!root.join(TRANSACTION).exists());
+    }
+}
+
+#[test]
+fn interrupted_owned_preparation_or_backup_does_not_publish_a_receipt() {
+    for phase in ["ready", "backup"] {
+        let (_temp, root) = fixture();
+        let mut installer = Process::start(&root, "owned-before-commit", "install-owned", phase);
+        installer.paused(phase);
+        let before = snapshot(&root);
+        Process::start(&root, "contender", "install-busy", "").success();
+        assert_eq!(snapshot(&root), before);
+        installer.stop();
+        Process::start(&root, "recover-original", "recover-ok", "").success();
+        assert_eq!(fs::read(root.join("Foo/old.lua")).unwrap(), b"original");
+        assert!(!root.join("Foo/new.lua").exists());
+        assert!(!root.join(".patchloom-ownership").exists());
+        assert!(!root.join(TRANSACTION).exists());
+    }
 }
 
 #[test]

@@ -59,6 +59,7 @@ pub struct Candidate {
 pub struct Installed {
     candidate: Candidate,
     pub folders: Vec<AddonFolder>,
+    pub receipt_id: String,
 }
 impl Installed {
     pub fn matches_release(&self, candidate: &Candidate) -> bool {
@@ -202,6 +203,37 @@ impl Candidate {
         previous: &[AddonFolder],
         cache: &Path,
     ) -> Result<Installed> {
+        self.install_validated(installation, previous, cache, |_| Ok(()))
+            .await
+    }
+
+    /// Receipt-based replacement always needs explicit confirmation under the installer lock.
+    pub async fn install_from_receipt(
+        &self,
+        installation: &Installation,
+        receipt_id: &str,
+        cache: &Path,
+        confirm: impl FnOnce(&crate::fs::OwnershipPreview) -> bool,
+    ) -> Result<Installed> {
+        let source = serde_json::to_value(self)?;
+        let previous = crate::fs::ownership::hints(
+            &installation.directory.join("Interface/AddOns"),
+            receipt_id,
+            &source,
+        )?;
+        self.install_validated(installation, &previous, cache, |root| {
+            crate::fs::ownership::authorize(root, receipt_id, &source, confirm)
+        })
+        .await
+    }
+
+    async fn install_validated(
+        &self,
+        installation: &Installation,
+        previous: &[AddonFolder],
+        cache: &Path,
+        validate_previous: impl FnOnce(&Path) -> io::Result<()>,
+    ) -> Result<Installed> {
         if self.product != installation.product || self.interface != installation.interface {
             return Err(invalid("Candidate/product mismatch").into());
         }
@@ -249,15 +281,20 @@ impl Candidate {
         {
             return Err(invalid("Installation changed during download; update cancelled").into());
         }
+        let mut receipt_id = None;
+        let source = serde_json::to_value(self)?;
         let folders =
             crate::fs::install_addon_checked(&addon, temporary.path(), &addons, |staged, _| {
-                discovery::parse_product_tocs(staged, self.product, self.interface)
-                    .map_err(Into::into)
+                validate_previous(&addons)?;
+                let folders = discovery::parse_product_tocs(staged, self.product, self.interface)?;
+                receipt_id = Some(crate::fs::ownership::prepare(staged, &addons, source)?);
+                Ok(folders)
             })
             .await?;
         Ok(Installed {
             candidate: self.clone(),
             folders,
+            receipt_id: receipt_id.ok_or_else(|| invalid("Ownership receipt was not prepared"))?,
         })
     }
 }
@@ -424,6 +461,137 @@ mod tests {
                 assert_eq!(fs::read(addons.join("Other/keep")).unwrap(), b"unowned");
                 assert!(!temp.path().join("escape").exists());
             }
+        });
+    }
+    #[test]
+    fn durable_receipt_reloads_for_confirmed_update_under_the_install_lock() {
+        async_std::task::block_on(async {
+            let (temp, installation, previous) = fixture();
+            let bytes = zip(&[
+                ("Foo/Foo.toc", "## Interface: 120105\n## Version: v2\n"),
+                ("Foo/new.lua", "v2"),
+            ]);
+            let mut first = candidate(&installation, &bytes);
+            first.url = server(bytes);
+            let installed = first
+                .install(&installation, &previous, temp.path())
+                .await
+                .unwrap();
+            let id = installed.receipt_id.clone();
+            drop(installed);
+            let root = installation.directory.join("Interface/AddOns");
+            assert_eq!(
+                crate::fs::inspect_ownership(&root, &id).unwrap().folders,
+                ["Foo"]
+            );
+            let bytes = zip(&[
+                ("Foo/Foo.toc", "## Interface: 120105\n## Version: v3\n"),
+                ("Foo/new.lua", "v3"),
+            ]);
+            let mut next = candidate(&installation, &bytes);
+            next.version = "v3".into();
+            next.asset_id = 3;
+            next.url = server(bytes.clone());
+            assert!(next
+                .install_from_receipt(&installation, &id, temp.path(), |_| false)
+                .await
+                .is_err());
+            assert_eq!(fs::read(root.join("Foo/new.lua")).unwrap(), b"v2");
+            next.url = server(bytes);
+            let updated = next
+                .install_from_receipt(&installation, &id, temp.path(), |preview| {
+                    assert_eq!(preview.folders, ["Foo"]);
+                    let lock = fs::File::open(root.join(".patchloom-install.lock")).unwrap();
+                    assert!(
+                        lock.try_lock().is_err(),
+                        "confirmation must run under installer lock"
+                    );
+                    true
+                })
+                .await
+                .unwrap();
+            assert_ne!(updated.receipt_id, id);
+            assert_eq!(updated.folders[0].version.as_deref(), Some("v3"));
+            assert_eq!(fs::read(root.join("Foo/new.lua")).unwrap(), b"v3");
+            assert!(
+                root.join(".patchloom-ownership")
+                    .join(format!("{id}.json"))
+                    .exists(),
+                "prior receipt is retained"
+            );
+            assert!(
+                crate::fs::inspect_ownership(&root, &id).is_err(),
+                "stale receipt cannot claim current contents"
+            );
+        });
+    }
+    #[test]
+    fn receipt_update_rechecks_modified_files_and_confirmation_window() {
+        async_std::task::block_on(async {
+            for change_during_confirmation in [false, true] {
+                let (temp, installation, previous) = fixture();
+                let bytes = zip(&[
+                    ("Foo/Foo.toc", "## Interface: 120105\n"),
+                    ("Foo/new.lua", "v2"),
+                ]);
+                let mut selected = candidate(&installation, &bytes);
+                selected.url = server(bytes.clone());
+                let receipt = selected
+                    .install(&installation, &previous, temp.path())
+                    .await
+                    .unwrap();
+                let root = installation.directory.join("Interface/AddOns");
+                if !change_during_confirmation {
+                    fs::write(root.join("Foo/new.lua"), "user-change").unwrap();
+                }
+                selected.url = server(bytes);
+                assert!(selected
+                    .install_from_receipt(&installation, &receipt.receipt_id, temp.path(), |_| {
+                        assert!(
+                            change_during_confirmation,
+                            "changed data must fail before confirmation"
+                        );
+                        fs::write(root.join("Foo/new.lua"), "user-change").unwrap();
+                        true
+                    })
+                    .await
+                    .is_err());
+                assert_eq!(fs::read(root.join("Foo/new.lua")).unwrap(), b"user-change");
+                assert!(!root.join(".patchloom-install").exists());
+            }
+        });
+    }
+    #[test]
+    fn failed_receipt_publication_reports_committed_state_and_keeps_original_backup() {
+        async_std::task::block_on(async {
+            let (temp, installation, previous) = fixture();
+            let root = installation.directory.join("Interface/AddOns");
+            fs::write(root.join(".patchloom-ownership"), b"unowned-conflict").unwrap();
+            let bytes = zip(&[
+                ("Foo/Foo.toc", "## Interface: 120105\n"),
+                ("Foo/new.lua", "new"),
+            ]);
+            let mut selected = candidate(&installation, &bytes);
+            selected.url = server(bytes);
+            let error = selected
+                .install(&installation, &previous, temp.path())
+                .await
+                .err()
+                .expect("publication conflict must not report success");
+            assert!(error.to_string().contains("Addon committed"));
+            assert_eq!(
+                fs::read(root.join(".patchloom-install/backup/Foo/old.lua")).unwrap(),
+                b"preserve"
+            );
+            assert_eq!(fs::read(root.join("Foo/new.lua")).unwrap(), b"new");
+            assert_eq!(
+                fs::read(root.join(".patchloom-ownership")).unwrap(),
+                b"unowned-conflict"
+            );
+            assert_eq!(
+                crate::fs::inspect_recovery(&root).unwrap().phase,
+                "committed-marker"
+            );
         });
     }
     #[test]

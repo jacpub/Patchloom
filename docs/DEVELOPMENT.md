@@ -211,10 +211,11 @@ The library pilot can update a disposable copied installation through the staged
 installer. It rechecks installation identity after downloading and validates all
 staged addon TOCs before replacing folders. Returned metadata comes from the
 selected product TOC. Callers must explicitly supply previously owned folders;
-discovery does not establish repository ownership. The returned receipt is in
-memory, and `matches_release` compares that receipt with remote metadata. It
-does not verify later changes on disk. Persistent ownership, GUI integration and
-the recovery cleanup flow are still required before public beta.
+discovery does not establish repository ownership. `matches_release` compares
+the returned receipt with remote metadata and does not verify later changes on
+disk. Receipt-based updates and the inspection command check saved content
+hashes separately. GUI integration and the recovery cleanup flow are still
+required before public beta.
 
 The SHA-256 implementation uses `sha2` 0.10.9 and seven new locked crypto
 packages including `sha2`. Its CPU-detection dependency requires a newer `libc`,
@@ -245,3 +246,43 @@ suite. These checks use disposable data; they do not certify live updates,
 power-loss durability, hostile concurrent filesystem writers or native macOS
 behavior. The old Ajour application self-update helper remains disabled through
 `no-self-update` and is outside this addon-download pilot.
+
+## Durable ownership receipts
+
+Successful provider installations publish versioned receipts in the copied
+AddOns root's `.patchloom-ownership` directory. Each receipt binds the canonical
+installation path, provider source, selected product, folder names and bounded
+SHA-256 content inventory. Files are append-only and named by their receipt
+checksum. Earlier receipts stay available; a receipt for older content becomes
+stale after an update.
+
+The installer prepares receipt data in its existing journal before commit.
+After committing replacement folders, it verifies their contents and publishes
+the receipt before deleting original backups, while holding the same OS lock.
+Restart recovery repeats receipt publication without overwriting existing files.
+Publication conflicts retain the original backup and replacement and report
+committed-but-pending state. A later cleanup error also reports pending state,
+even if receipt journal files have already been removed. Do not treat that
+error as a rollback or immediately reinstall over retained recovery state.
+
+Saved receipts and checksums do not authenticate provenance or grant permission
+to delete folders. `install_from_receipt` treats loaded folder names as hints,
+then checks installation/source/product binding and current contents under the
+installer lock. It requires explicit confirmation of the exact folder list and
+rechecks both receipt and contents afterward. Changed files, unknown versions,
+foreign installations and mismatched sources fail without replacing folders.
+There is no unattended receipt-based update path or automatic legacy adoption.
+
+`inspect_ownership <copied-AddOns-root> <receipt-id>` prints a read-only snapshot
+only when receipt contents still match the installation. It does not load user
+configuration or contact a provider, and inspection does not authorize a later
+write. Receipts can contain local paths; exclude private paths from bug reports.
+
+Receipt reads are limited to 1 MiB. Content snapshots reject links, reparse
+points, special files and invalid paths; they allow at most 10,000 entries,
+128 MiB per file and 512 MiB total. The journal and receipt directory remain
+reserved from archive installation. These bounds and explicit confirmation
+support cooperating updater processes. Hostile concurrent writers, power-loss
+durability, receipt garbage collection, GUI confirmation and native macOS checks
+still require separate work. Originals may already be cleaned up when a late
+metadata-cleanup error occurs; the committed receipt and replacement remain.
