@@ -446,18 +446,90 @@ fn rollback(root: &Path, plan: &Plan, published: &[String]) -> Result<()> {
     cleanup_transaction(&transaction, plan)
 }
 
-// Restart recovery never deletes an AddOns destination based on journal claims alone.
-fn recover(root: &Path) -> Result<()> {
+/// A snapshot for inspection only. Journal claims never authorize deleting files.
+#[derive(Debug, Serialize)]
+pub struct RecoveryInspection {
+    pub root: std::path::PathBuf,
+    pub phase: String,
+    pub previous: Vec<String>,
+    pub incoming: Vec<String>,
+    pub backups: Vec<String>,
+    pub staged: Vec<String>,
+    pub destinations: Vec<String>,
+}
+
+/// Inspect retained installation state without creating or changing any files.
+/// Cooperating installers are excluded when their existing lock file is present.
+pub fn inspect_recovery(directory: &Path) -> Result<RecoveryInspection> {
+    if is_link(&fs::symlink_metadata(directory)?) || !directory.is_dir() {
+        return Err(invalid("AddOns root must be an existing directory, not a link").into());
+    }
+    let root = directory.canonicalize()?;
+    let lock_path = root.join(LOCK);
+    let _lock = if exists(&lock_path)? {
+        let metadata = fs::symlink_metadata(&lock_path)?;
+        if is_link(&metadata) || !metadata.is_file() {
+            return Err(invalid("Invalid install lock file").into());
+        }
+        let file = File::open(lock_path)?;
+        file.try_lock()
+            .map_err(|_| invalid("Addon installation is busy; retry inspection later"))?;
+        Some(file)
+    } else {
+        None
+    };
+    let mut report = RecoveryInspection {
+        root: root.clone(),
+        phase: "none".into(),
+        previous: vec![],
+        incoming: vec![],
+        backups: vec![],
+        staged: vec![],
+        destinations: vec![],
+    };
     let transaction = root.join(TRANSACTION);
     if !exists(&transaction)? {
-        return Ok(());
+        return Ok(report);
     }
     plain_tree(&transaction)?;
-    let plan_path = transaction.join("plan.yml");
-    if !exists(&plan_path)? {
-        fs::remove_dir(&transaction)?; // Only an empty, interrupted directory creation is safe.
-        return Ok(());
+    let plan = read_plan(&transaction)?;
+    validate_transaction(&transaction, &plan)?;
+    report.phase = if marker(&transaction.join("committed"))? {
+        "committed-marker"
+    } else if marker(&transaction.join("ready"))? {
+        "ready-marker"
+    } else {
+        "unmarked"
     }
+    .into();
+    for name in plan
+        .previous
+        .iter()
+        .chain(&plan.incoming)
+        .collect::<BTreeSet<_>>()
+    {
+        for (base, names) in [
+            (transaction.join("backup"), &mut report.backups),
+            (transaction.join("staged"), &mut report.staged),
+            (root.clone(), &mut report.destinations),
+        ] {
+            let path = base.join(name);
+            if exists(&path)? {
+                let metadata = fs::symlink_metadata(path)?;
+                if is_link(&metadata) || !metadata.is_dir() {
+                    return Err(invalid("Unexpected recovery folder type; state retained").into());
+                }
+                names.push(name.clone());
+            }
+        }
+    }
+    report.previous = plan.previous;
+    report.incoming = plan.incoming;
+    Ok(report)
+}
+
+fn read_plan(transaction: &Path) -> Result<Plan> {
+    let plan_path = transaction.join("plan.yml");
     let file = File::open(plan_path)?;
     if file.metadata()?.len() > 1024 * 1024 {
         return Err(invalid("Oversized install journal").into());
@@ -488,6 +560,22 @@ fn recover(root: &Path) -> Result<()> {
             return Err(invalid("Case collision in install journal").into());
         }
     }
+    Ok(plan)
+}
+
+// Restart recovery never deletes an AddOns destination based on journal claims alone.
+fn recover(root: &Path) -> Result<()> {
+    let transaction = root.join(TRANSACTION);
+    if !exists(&transaction)? {
+        return Ok(());
+    }
+    plain_tree(&transaction)?;
+    let plan_path = transaction.join("plan.yml");
+    if !exists(&plan_path)? {
+        fs::remove_dir(&transaction)?; // Only an empty, interrupted directory creation is safe.
+        return Ok(());
+    }
+    let plan = read_plan(&transaction)?;
     let staging = transaction.join("staged");
     let backups = transaction.join("backup");
     validate_transaction(&transaction, &plan)?;
@@ -671,6 +759,48 @@ mod tests {
             ..Default::default()
         });
         (temp, addon, downloads, root)
+    }
+
+    #[test]
+    fn inspection_preserves_clean_and_ambiguous_state() {
+        let (_temp, _addon, _downloads, root) = fixture();
+        assert_eq!(inspect_recovery(&root).unwrap().phase, "none");
+        assert!(!root.join(LOCK).exists());
+        let transaction = pending(
+            &root,
+            &Plan {
+                version: 1,
+                previous: vec!["Foo".into()],
+                incoming: vec!["Foo".into()],
+            },
+        );
+        fs::create_dir(transaction.join("backup/Foo")).unwrap();
+        fs::write(transaction.join("backup/Foo/old.lua"), b"backup").unwrap();
+        let report = inspect_recovery(&root).unwrap();
+        assert_eq!(report.phase, "ready-marker");
+        assert_eq!(report.backups, ["Foo"]);
+        assert_eq!(report.destinations, ["Foo"]);
+        assert!(report.staged.is_empty());
+        assert_eq!(fs::read(root.join("Foo/old.lua")).unwrap(), b"original");
+        assert_eq!(
+            fs::read(transaction.join("backup/Foo/old.lua")).unwrap(),
+            b"backup"
+        );
+        fs::remove_file(transaction.join("ready")).unwrap();
+        fs::create_dir(transaction.join("committed")).unwrap();
+        assert!(inspect_recovery(&root).is_err());
+        assert!(transaction.join("backup/Foo/old.lua").exists());
+    }
+
+    #[test]
+    fn inspection_respects_existing_lock_without_creating_state() {
+        let (_temp, _addon, _downloads, root) = fixture();
+        let file = File::create(root.join(LOCK)).unwrap();
+        file.lock().unwrap();
+        assert!(inspect_recovery(&root).is_err());
+        drop(file);
+        assert!(inspect_recovery(&root).is_ok());
+        assert_eq!(fs::read(root.join(LOCK)).unwrap(), b"");
     }
 
     pub(super) fn archive(path: &Path, entries: &[(&str, &[u8])]) {

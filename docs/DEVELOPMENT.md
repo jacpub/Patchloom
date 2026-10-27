@@ -1,5 +1,24 @@
 # Patchloom developer notes
 
+## Inspecting an interrupted install
+
+The standalone `inspect_recovery` command reads a supplied AddOns fixture and
+prints the journal phase plus retained backup, staging and destination folders.
+It does not start the GUI, load application configuration, contact providers,
+or create, restore or delete addon/journal files. If an installer lock file
+exists, its lock must be available; busy or malformed state returns an error.
+
+```sh
+cargo run -p ajour-core --bin inspect_recovery --locked \
+  --features no-self-update -- <fixture-AddOns-directory>
+```
+
+The report is an inspection snapshot. Journal claims and marker names do not
+authorize recovery actions. Keep ambiguous versions intact; selecting and
+executing a verified restore remains a later milestone. Missing lock files
+and non-cooperating writers limit snapshot consistency. Use disposable fixtures
+while this workflow is under development.
+
 ## Development status
 
 There is no public Patchloom release yet. The current work is on
