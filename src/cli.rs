@@ -70,10 +70,11 @@ pub fn validate_opts_or_exit(
             author = env!("CARGO_PKG_AUTHORS"),
             setting = AppSettings::DisableHelpSubcommand)]
 pub struct Opts {
+    // Modified 2026-10-28; original GPLv3 applies.
     #[structopt(
         long,
         parse(from_os_str),
-        help = "Open a read-only preview of an explicitly selected copied WoW folder"
+        help = "Open a copied WoW folder for inventory and recovery review; restoring originals requires confirmation"
     )]
     pub preview: Option<PathBuf>,
     #[structopt(

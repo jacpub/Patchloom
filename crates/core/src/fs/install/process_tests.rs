@@ -481,3 +481,46 @@ fn final_marker_rename_failure_restores_original_before_child_exit() {
     assert!(error.contains("Install failed"), "{}", error);
     assert!(root.join(TRANSACTION).exists()); // The held marker also prevented cleanup; no data guessed at.
 }
+
+// Added 2026-10-28; original Ajour GPLv3 applies.
+// Modified 2026-10-28; original Ajour GPLv3 applies.
+#[test]
+fn approval_obeys_another_process_lock_and_can_cancel_after_its_release() {
+    let (_temp, root) = fixture();
+    let mut installer = Process::start(&root, "approval-published", "install", "published");
+    installer.paused("published");
+    installer.stop();
+    let ticket = preflight_restore_originals(&root).unwrap();
+    let before = snapshot(&root);
+    let mutex_before = fs::read(root.join(LOCK)).unwrap();
+    let mut holder = Process::start(&root, "approval-holder", "install", "locked");
+    holder.paused("locked");
+    assert!(preflight_restore_originals(&root).is_err());
+    assert!(
+        restore_originals_checked(&root, &ticket, |_, _| panic!("other process owns lock"))
+            .is_err()
+    );
+    assert_eq!(snapshot(&root), before);
+    assert!(!root.join(RESTORE).exists());
+    holder.stop();
+
+    // Both a fresh preview and the unchanged earlier ticket work after release.
+    let fresh = preflight_restore_originals(&root).unwrap();
+    assert_eq!(snapshot(&root), before);
+    for approval in [&ticket, &fresh] {
+        let mut calls = 0;
+        assert_eq!(
+            restore_originals_checked(&root, approval, |_, _| {
+                calls += 1;
+                assert!(preflight_restore_originals(&root).is_err());
+                false
+            })
+            .unwrap(),
+            RecoveryRestoreOutcome::Cancelled
+        );
+        assert_eq!(calls, 1);
+        assert_eq!(snapshot(&root), before);
+        assert_eq!(fs::read(root.join(LOCK)).unwrap(), mutex_before);
+        assert!(!root.join(RESTORE).exists());
+    }
+}

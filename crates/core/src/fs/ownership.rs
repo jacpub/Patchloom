@@ -80,43 +80,109 @@ fn folders(names: &[String]) -> io::Result<()> {
 }
 fn snapshot(root: &Path, names: &[String]) -> io::Result<BTreeMap<String, String>> {
     folders(names)?;
-    let mut files = BTreeMap::new();
-    let mut total = 0u64;
     for name in names {
         plain(&root.join(name), true)?;
-        for entry in walkdir::WalkDir::new(root.join(name)).follow_links(false) {
+    }
+    snapshot_paths(root, names)
+}
+
+// Modified 2026-10-28; original GPLv3 applies.
+// Callers supply explicit direct children: validated addon names or fixed journals.
+// Missing children are recorded; links, special files and ambiguous names fail closed.
+pub(super) fn snapshot_paths(
+    root: &Path,
+    names: &[String],
+) -> io::Result<BTreeMap<String, String>> {
+    plain(root, true)?;
+    if names.len() > 10_000 {
+        return Err(invalid("Snapshot has too many entries"));
+    }
+    let mut wanted = BTreeMap::new();
+    for name in names {
+        component(name)?;
+        if wanted.insert(name.to_lowercase(), name.as_str()).is_some() {
+            return Err(invalid("Snapshot paths have ambiguous spelling"));
+        }
+    }
+    // Check actual direct-child spelling, including on case-insensitive filesystems.
+    // Unrelated children are counted for this enumeration bound, not read or hashed.
+    for (index, entry) in fs::read_dir(root)?.enumerate() {
+        if index >= 10_000 {
+            return Err(invalid("Snapshot root has too many entries"));
+        }
+        let entry = entry?;
+        let name = entry.file_name();
+        if let Some(name) = name.to_str() {
+            if let Some(expected) = wanted.get(&name.to_lowercase()) {
+                if *expected != name {
+                    return Err(invalid("Snapshot paths have ambiguous spelling"));
+                }
+            }
+        }
+    }
+    let mut files = BTreeMap::new();
+    let mut spellings = BTreeSet::new();
+    let mut total = 0u64;
+    for name in names {
+        if files.len() >= 10_000 {
+            return Err(invalid("Snapshot has too many entries"));
+        }
+        let path = root.join(name);
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                files.insert(name.clone(), "missing".into());
+                spellings.insert(name.to_lowercase());
+                continue;
+            }
+            Err(error) => return Err(error),
+            Ok(_) => {}
+        }
+        // A depth-64 entry has 65 components relative to root and is rejected
+        // below; traversal therefore never silently omits a permitted subtree.
+        for entry in walkdir::WalkDir::new(&path)
+            .follow_links(false)
+            .max_open(1)
+            .max_depth(64)
+        {
             let entry = entry.map_err(io::Error::other)?;
             if files.len() >= 10_000 {
-                return Err(invalid("Ownership snapshot has too many entries"));
+                return Err(invalid("Snapshot has too many entries"));
             }
             let metadata = fs::symlink_metadata(entry.path())?;
             if is_link(&metadata) || (!metadata.is_file() && !metadata.is_dir()) {
-                return Err(invalid(
-                    "Ownership snapshot rejects links and special files",
-                ));
+                return Err(invalid("Snapshot rejects links and special files"));
             }
             let relative = entry
                 .path()
                 .strip_prefix(root)
-                .map_err(|_| invalid("Ownership path escaped its root"))?;
+                .map_err(|_| invalid("Snapshot path escaped its root"))?;
             let parts: Vec<_> = relative
                 .components()
-                .map(|p| {
-                    p.as_os_str()
+                .map(|part| {
+                    part.as_os_str()
                         .to_str()
-                        .ok_or_else(|| invalid("Ownership path is not UTF-8"))
+                        .ok_or_else(|| invalid("Snapshot path is not UTF-8"))
                 })
                 .collect::<io::Result<_>>()?;
+            if parts.len() > 64 {
+                return Err(invalid("Snapshot path exceeds its length or depth limit"));
+            }
             for part in &parts {
                 component(part)?;
             }
             let spelling = parts.join("/");
             if spelling.len() > 1024 {
-                return Err(invalid("Ownership path is too long"));
+                return Err(invalid("Snapshot path exceeds its length or depth limit"));
+            }
+            if !spellings.insert(spelling.to_lowercase()) {
+                return Err(invalid("Snapshot paths have ambiguous spelling"));
             }
             let value = if metadata.is_dir() {
                 "directory".into()
             } else {
+                if metadata.len() > 128 * 1024 * 1024 {
+                    return Err(invalid("Snapshot exceeds byte limits"));
+                }
                 let mut hasher = Sha256::new();
                 let mut file = File::open(entry.path())?;
                 let mut buffer = [0u8; 16 * 1024];
@@ -129,7 +195,7 @@ fn snapshot(root: &Path, names: &[String]) -> io::Result<BTreeMap<String, String
                     size += n as u64;
                     total += n as u64;
                     if size > 128 * 1024 * 1024 || total > 512 * 1024 * 1024 {
-                        return Err(invalid("Ownership snapshot exceeds byte limits"));
+                        return Err(invalid("Snapshot exceeds byte limits"));
                     }
                     hasher.update(&buffer[..n]);
                 }
@@ -341,6 +407,181 @@ mod tests {
         fs::rename(transaction.join("staged/Foo"), root.join("Foo")).unwrap();
         (temp, root, transaction, id)
     }
+    // Added 2026-10-28; original GPLv3 applies.
+    #[test]
+    fn approval_refactor_preserves_receipt_bytes_and_content_authorization() {
+        let (temp, root, transaction, id) = fixture();
+        let expected_files = BTreeMap::from([
+            ("Foo".into(), "directory".into()),
+            (
+                "Foo/a.lua".into(),
+                format!("sha256:{:x}", Sha256::digest(b"new")),
+            ),
+        ]);
+        let expected = Receipt {
+            format: 1,
+            root: root.canonicalize().unwrap(),
+            source: serde_json::json!({"repository":"fixture/addon","product":"Retail"}),
+            folders: vec!["Foo".into()],
+            files: expected_files,
+        };
+        let bytes = serde_json::to_vec(&expected).unwrap();
+        assert_eq!(fs::read(transaction.join("receipt.json")).unwrap(), bytes);
+        assert_eq!(id, format!("{:x}", Sha256::digest(&bytes)));
+        assert_eq!(snapshot(&root, &["Foo".into()]).unwrap(), expected.files);
+        publish(&root, &transaction, &["Foo".into()]).unwrap();
+        let published = root.join(STORE).join(format!("{id}.json"));
+        assert_eq!(fs::read(&published).unwrap(), bytes);
+        let source = expected.source;
+        assert!(authorize(&root, &id, &source, |_| true).is_ok());
+        assert!(authorize(&root, &id, &source, |_| false).is_err());
+        assert_eq!(fs::read(root.join("Foo/a.lua")).unwrap(), b"new");
+        assert!(authorize(&root, &id, &source, |_| {
+            fs::write(root.join("Foo/a.lua"), b"NEW").unwrap();
+            true
+        })
+        .is_err());
+        assert!(inspect_ownership(&root, &id).is_err());
+        // Existing hints remain hints, not content authorization.
+        assert_eq!(hints(&root, &id, &source).unwrap()[0].id, "Foo");
+        assert!(authorize(&root, &id, &source, |_| panic!("stale receipt")).is_err());
+        assert_eq!(fs::read(&published).unwrap(), bytes);
+        fs::rename(root.join("Foo"), temp.path().join("preserved-Foo")).unwrap();
+        assert!(snapshot(&root, &["Foo".into()]).is_err());
+        assert_eq!(
+            snapshot_paths(&root, &["Foo".into()]).unwrap()["Foo"],
+            "missing"
+        );
+    }
+
+    #[test]
+    fn approval_snapshot_does_not_weaken_owned_folder_or_component_grammar() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        for name in ["WTF", "SavedVariables", ".patchloom-install"] {
+            fs::create_dir(root.join(name)).unwrap();
+            assert!(snapshot(root, &[name.into()]).is_err());
+            assert_eq!(
+                snapshot_paths(root, &[name.into()]).unwrap()[name],
+                "directory"
+            );
+        }
+        for name in ["../escape", "Foo/child", "NUL", "Foo:stream"] {
+            assert!(snapshot_paths(root, &[name.into()]).is_err());
+        }
+        fs::create_dir(root.join("Foo")).unwrap();
+        assert!(snapshot_paths(root, &["Foo".into(), "foo".into()]).is_err());
+        fs::rename(root.join("Foo"), root.join("fOO")).unwrap();
+        assert!(snapshot_paths(root, &["Foo".into()]).is_err());
+    }
+
+    #[test]
+    fn approval_snapshot_depth_length_file_and_journal_read_bounds() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let names = ["Foo".into()];
+        fs::create_dir(root.join("Foo")).unwrap();
+        let mut path = root.join("Foo");
+        for _ in 1..64 {
+            path = path.join("a");
+            fs::create_dir(&path).unwrap();
+        }
+        assert_eq!(snapshot_paths(&root, &names).unwrap().len(), 64);
+        fs::create_dir(path.join("a")).unwrap();
+        assert!(snapshot_paths(&root, &names)
+            .unwrap_err()
+            .to_string()
+            .contains("depth"));
+        // Move the known fixture tree aside; do not recursively delete it.
+        fs::rename(root.join("Foo"), root.join("depth-fixture")).unwrap();
+        fs::create_dir(root.join("Foo")).unwrap();
+        let mut path = root.join("Foo");
+        for length in [255, 255, 255, 252] {
+            path = path.join("x".repeat(length));
+            fs::create_dir(&path).unwrap();
+        }
+        assert_eq!(
+            path.strip_prefix(&root).unwrap().to_string_lossy().len(),
+            1024
+        );
+        assert!(snapshot_paths(&root, &names).is_ok());
+        fs::create_dir(path.join("x")).unwrap();
+        assert!(snapshot_paths(&root, &names)
+            .unwrap_err()
+            .to_string()
+            .contains("length"));
+        fs::rename(root.join("Foo"), root.join("length-fixture")).unwrap();
+        fs::create_dir(root.join("Foo")).unwrap();
+        let oversized = root.join("Foo/oversized");
+        File::create(&oversized)
+            .unwrap()
+            .set_len(128 * 1024 * 1024 + 1)
+            .unwrap();
+        assert!(snapshot_paths(&root, &names)
+            .unwrap_err()
+            .to_string()
+            .contains("byte"));
+        assert_eq!(
+            fs::metadata(&oversized).unwrap().len(),
+            128 * 1024 * 1024 + 1
+        );
+    }
+
+    #[test]
+    #[ignore = "explicit disposable 10000-entry boundary test"]
+    fn approval_snapshot_entry_bounds() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("AddOns");
+        fs::create_dir_all(root.join("Foo")).unwrap();
+        let names = ["Foo".into()];
+        assert!(snapshot_paths(&root, &vec!["unused".into(); 10_001]).is_err());
+        for index in 0..9_999 {
+            fs::create_dir(root.join("Foo").join(format!("e{index}"))).unwrap();
+        }
+        assert_eq!(snapshot_paths(&root, &names).unwrap().len(), 10_000);
+        fs::create_dir(root.join("Foo/overflow")).unwrap();
+        assert!(snapshot_paths(&root, &names)
+            .unwrap_err()
+            .to_string()
+            .contains("entries"));
+        fs::rename(
+            root.join("Foo"),
+            temp.path().join("preserved-entry-fixture"),
+        )
+        .unwrap();
+        for index in 0..10_000 {
+            fs::create_dir(root.join(format!("unrelated{index}"))).unwrap();
+        }
+        assert_eq!(snapshot_paths(&root, &names).unwrap()["Foo"], "missing");
+        fs::create_dir(root.join("overflow")).unwrap();
+        assert!(snapshot_paths(&root, &names)
+            .unwrap_err()
+            .to_string()
+            .contains("root"));
+    }
+
+    #[test]
+    #[ignore = "explicit disposable 512 MiB hashing boundary test"]
+    fn approval_snapshot_total_byte_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::create_dir(root.join("Foo")).unwrap();
+        for index in 0..4 {
+            File::create(root.join("Foo").join(format!("f{index}")))
+                .unwrap()
+                .set_len(128 * 1024 * 1024)
+                .unwrap();
+        }
+        let names = ["Foo".into()];
+        assert!(snapshot_paths(root, &names).is_ok());
+        fs::write(root.join("Foo/one-more-byte"), b"x").unwrap();
+        assert!(snapshot_paths(root, &names)
+            .unwrap_err()
+            .to_string()
+            .contains("byte"));
+        assert_eq!(fs::read(root.join("Foo/one-more-byte")).unwrap(), b"x");
+    }
+
     #[test]
     fn publication_is_append_only_and_restart_can_use_published_payload() {
         let (_temp, root, transaction, id) = fixture();

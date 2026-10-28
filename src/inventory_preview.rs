@@ -1,4 +1,6 @@
-//! Isolated read-only Patchloom inventory preview, 2026-10-27; original GPLv3 applies.
+//! Patchloom inventory and explicit recovery, 2026-10-28; original GPLv3 applies.
+//! Inventory and recovery inspection do not change files. Restoring originals
+//! requires a validated preview and fresh confirmation for the selected scope.
 use ajour_core::discovery::{self, Discovery, Installation, Product};
 use iced::{
     button, container, scrollable, text_input, Application, Button, Clipboard, Column, Command,
@@ -29,6 +31,67 @@ struct ReleaseRequest {
     product: Product,
     inventory: Arc<Discovery>,
     token: Arc<()>,
+}
+
+// Added 2026-10-28; original GPLv3 applies.
+#[derive(Debug, Clone)]
+enum RecoveryAction {
+    Inspect,
+    Preview,
+    Restore(Arc<ajour_core::fs::RecoveryApproval>),
+}
+
+#[derive(Debug, Clone)]
+struct RecoveryRequest {
+    root: PathBuf,
+    addons: PathBuf,
+    product: Product,
+    generation: Arc<()>,
+    token: Arc<()>,
+    action: RecoveryAction,
+}
+
+impl RecoveryRequest {
+    fn same_request(&self, other: &Self) -> bool {
+        self.root == other.root
+            && self.addons == other.addons
+            && self.product == other.product
+            && Arc::ptr_eq(&self.generation, &other.generation)
+            && Arc::ptr_eq(&self.token, &other.token)
+            && match (&self.action, &other.action) {
+                (RecoveryAction::Inspect, RecoveryAction::Inspect)
+                | (RecoveryAction::Preview, RecoveryAction::Preview) => true,
+                (RecoveryAction::Restore(a), RecoveryAction::Restore(b)) => Arc::ptr_eq(a, b),
+                _ => false,
+            }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RecoveryPreview {
+    request: RecoveryRequest,
+    approval: Arc<ajour_core::fs::RecoveryApproval>,
+}
+
+#[derive(Debug, Clone)]
+enum RecoveryResult {
+    Inspection(Result<Arc<ajour_core::fs::RecoveryInspection>, String>),
+    Preview(Result<Arc<ajour_core::fs::RecoveryApproval>, String>),
+    Restore {
+        outcome: Result<ajour_core::fs::RecoveryRestoreOutcome, String>,
+        inspection: Result<Arc<ajour_core::fs::RecoveryInspection>, String>,
+    },
+}
+
+impl RecoveryResult {
+    fn matches_action(&self, action: &RecoveryAction) -> bool {
+        matches!(
+            (self, action),
+            (Self::Inspection(_), RecoveryAction::Inspect)
+                | (Self::Preview(_), RecoveryAction::Preview)
+                | (Self::Restore { .. }, RecoveryAction::Restore(_))
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -114,6 +177,26 @@ struct Model {
     release_worker: Option<Arc<()>>,
     #[serde(skip)]
     release_retry_at: Option<RetryDeadline>,
+    // Recovery borrows receipt_worker's existing physical filesystem slot.
+    // Logical invalidation clears pending_recovery, never recovery_job.
+    #[serde(skip)]
+    recovery_job: Option<RecoveryRequest>,
+    #[serde(skip)]
+    pending_recovery: Option<RecoveryRequest>,
+    #[serde(skip)]
+    recovery_inspection: Option<Arc<ajour_core::fs::RecoveryInspection>>,
+    #[serde(skip)]
+    recovery_preview: Option<RecoveryPreview>,
+    #[serde(skip)]
+    recovery_ack: String,
+    #[serde(skip)]
+    recovery_page: usize,
+    #[serde(skip)]
+    recovery_error: Option<String>,
+    #[serde(skip)]
+    recovery_outcome: Option<Result<ajour_core::fs::RecoveryRestoreOutcome, String>>,
+    #[serde(skip)]
+    recovery_post_error: Option<String>,
 }
 impl Model {
     fn new(root: PathBuf) -> Self {
@@ -135,11 +218,24 @@ impl Model {
             pending_release: None,
             release_worker: None,
             release_retry_at: None,
+            recovery_job: None,
+            pending_recovery: None,
+            recovery_inspection: None,
+            recovery_preview: None,
+            recovery_ack: String::new(),
+            recovery_page: 0,
+            recovery_error: None,
+            recovery_outcome: None,
+            recovery_post_error: None,
         }
     }
     // Modified 2026-10-28; original GPLv3 applies.
     // Logical invalidation never releases a physical worker or provider wait.
+    // Logical invalidation never releases a physical worker or provider wait.
     fn invalidate_snapshot(&mut self) {
+        if self.restoring() {
+            return;
+        }
         self.generation = Arc::new(());
         self.scan_requested = false;
         self.inventory = None;
@@ -147,9 +243,13 @@ impl Model {
         self.error = None;
         self.clear_receipt();
         self.clear_release();
+        self.clear_recovery();
     }
 
     fn set_root(&mut self, root: PathBuf) {
+        if self.restoring() {
+            return;
+        }
         self.invalidate_snapshot();
         self.root = root;
     }
@@ -162,6 +262,9 @@ impl Model {
         }
     }
     fn begin_scan(&mut self) -> Option<ScanRequest> {
+        if self.restoring() {
+            return None;
+        }
         self.invalidate_snapshot();
         if self.root.as_os_str().is_empty() {
             self.error = Some("Enter a copied WoW folder path, then click Open.".into());
@@ -255,6 +358,11 @@ impl Model {
         request: ReceiptRequest,
         result: Result<Arc<ajour_core::fs::OwnershipPreview>, String>,
     ) -> bool {
+        // Recovery uses this physical slot too. A receipt message cannot
+        // complete a recovery job, even if supplied with its token.
+        if self.recovery_job.is_some() {
+            return false;
+        }
         if !self
             .receipt_worker
             .as_ref()
@@ -292,6 +400,9 @@ impl Model {
         true
     }
     fn select(&mut self, product: Product) {
+        if self.restoring() {
+            return;
+        }
         if self
             .inventory
             .as_ref()
@@ -300,6 +411,7 @@ impl Model {
             if self.selected != Some(product) {
                 self.clear_receipt();
                 self.clear_release();
+                self.clear_recovery();
             }
             self.selected = Some(product);
         }
@@ -324,7 +436,11 @@ impl Model {
     }
 
     fn receipt_status(&self) -> Option<&'static str> {
-        self.receipt_worker.as_ref().map(|_| "Checking receipt...")
+        if self.recovery_job.is_some() {
+            None
+        } else {
+            self.receipt_worker.as_ref().map(|_| "Checking receipt...")
+        }
     }
 
     fn can_inspect_receipt(&self) -> bool {
@@ -359,6 +475,7 @@ impl Model {
             && self.installation().is_some()
             && self.scan.is_none()
             && !self.scan_requested
+            && !self.restoring()
             && self.release_worker.is_none()
     }
 
@@ -459,6 +576,255 @@ impl Model {
         )
     }
 
+    // Added 2026-10-28; original GPLv3 applies.
+    fn restoring(&self) -> bool {
+        self.recovery_job
+            .as_ref()
+            .is_some_and(|job| matches!(&job.action, RecoveryAction::Restore(_)))
+    }
+
+    fn clear_recovery(&mut self) {
+        self.pending_recovery = None;
+        self.recovery_inspection = None;
+        self.recovery_preview = None;
+        self.recovery_ack.clear();
+        self.recovery_page = 0;
+        self.recovery_error = None;
+        self.recovery_outcome = None;
+        self.recovery_post_error = None;
+        // recovery_job and receipt_worker describe physical work, not display.
+    }
+
+    fn recovery_scope_current(&self, request: &RecoveryRequest) -> bool {
+        if self.root != request.root
+            || self.selected != Some(request.product)
+            || !Arc::ptr_eq(&self.generation, &request.generation)
+        {
+            return false;
+        }
+        // Restore admission deliberately invalidates the old inventory.
+        // Root/product/generation cannot change through admitted GUI actions
+        // until the physical restore and post-inspection have completed.
+        if matches!(&request.action, RecoveryAction::Restore(_)) {
+            return true;
+        }
+        self.installation().is_some_and(|installation| {
+            installation.directory.join("Interface").join("AddOns") == request.addons
+        })
+    }
+
+    fn recovery_slot_available(&self) -> bool {
+        self.scan.is_none()
+            && !self.scan_requested
+            && self.receipt_worker.is_none()
+            && self.recovery_job.is_none()
+    }
+
+    fn can_inspect_recovery(&self) -> bool {
+        self.installation().is_some() && self.recovery_slot_available()
+    }
+
+    fn can_preview_recovery(&self) -> bool {
+        self.can_inspect_recovery()
+            && self
+                .recovery_inspection
+                .as_ref()
+                .is_some_and(|inspection| inspection.phase != "none")
+    }
+
+    fn begin_recovery(&mut self, preview: bool) -> Option<RecoveryRequest> {
+        if if preview {
+            !self.can_preview_recovery()
+        } else {
+            !self.can_inspect_recovery()
+        } {
+            return None;
+        }
+        let installation = self.installation()?;
+        let request = RecoveryRequest {
+            root: self.root.clone(),
+            addons: installation.directory.join("Interface").join("AddOns"),
+            product: installation.product,
+            generation: self.generation.clone(),
+            token: Arc::new(()),
+            action: if preview {
+                RecoveryAction::Preview
+            } else {
+                RecoveryAction::Inspect
+            },
+        };
+        if !preview {
+            self.clear_recovery();
+        } else {
+            self.recovery_preview = None;
+            self.recovery_ack.clear();
+            self.recovery_page = 0;
+            self.recovery_error = None;
+            self.recovery_outcome = None;
+            self.recovery_post_error = None;
+        }
+
+        // Reserve synchronously, before constructing the Command. Existing
+        // scan/receipt admission already checks this physical reservation.
+        self.receipt_worker = Some(request.token.clone());
+        self.recovery_job = Some(request.clone());
+        self.pending_recovery = Some(request.clone());
+        Some(request)
+    }
+
+    fn current_recovery_preview(&self, preview: &RecoveryPreview) -> bool {
+        self.recovery_scope_current(&preview.request)
+            && self.recovery_preview.as_ref().is_some_and(|current| {
+                current.request.same_request(&preview.request)
+                    && Arc::ptr_eq(&current.approval, &preview.approval)
+                    && current.approval.root() == preview.approval.root()
+            })
+    }
+
+    fn set_recovery_ack(&mut self, preview: &RecoveryPreview, answer: String) {
+        if self.recovery_slot_available() && self.current_recovery_preview(preview) {
+            // No trimming, case folding or reuse across preview identities.
+            self.recovery_ack = answer.chars().take(7).collect();
+        }
+    }
+
+    fn cancel_recovery_preview(&mut self, preview: &RecoveryPreview) {
+        if self.recovery_slot_available() && self.current_recovery_preview(preview) {
+            self.recovery_preview = None;
+            self.recovery_ack.clear();
+            self.recovery_page = 0;
+            self.recovery_error = Some("Preview cancelled. No addon folders were changed.".into());
+        }
+    }
+
+    fn can_restore_recovery(&self, preview: &RecoveryPreview) -> bool {
+        self.recovery_slot_available()
+            && self.recovery_ack == "RESTORE"
+            && self.current_recovery_preview(preview)
+    }
+
+    fn begin_restore_recovery(&mut self, preview: &RecoveryPreview) -> Option<RecoveryRequest> {
+        if !self.can_restore_recovery(preview) {
+            return None;
+        }
+        let request = RecoveryRequest {
+            root: preview.request.root.clone(),
+            addons: preview.request.addons.clone(),
+            product: preview.request.product,
+            generation: preview.request.generation.clone(),
+            token: Arc::new(()),
+            action: RecoveryAction::Restore(preview.approval.clone()),
+        };
+
+        // Consume consent before dispatch. A duplicate click cannot reuse it.
+        self.recovery_preview = None;
+        self.recovery_ack.clear();
+        self.recovery_page = 0;
+        self.recovery_inspection = None;
+        self.recovery_error = None;
+        self.recovery_outcome = None;
+        self.recovery_post_error = None;
+
+        // This attempt can write. Old inventory/ownership and provider display
+        // assumptions cease to apply even if core later returns an error.
+        self.inventory = None;
+        self.error = None;
+        self.clear_receipt();
+        self.clear_release();
+        // Preserve selected scope, generation, physical provider reservation
+        // and release_retry_at. No provider request is queued or retried.
+        self.receipt_worker = Some(request.token.clone());
+        self.recovery_job = Some(request.clone());
+        self.pending_recovery = Some(request.clone());
+        Some(request)
+    }
+
+    fn complete_recovery(&mut self, request: RecoveryRequest, result: RecoveryResult) -> bool {
+        if !self
+            .recovery_job
+            .as_ref()
+            .is_some_and(|job| job.same_request(&request) && result.matches_action(&job.action))
+            || !self
+                .receipt_worker
+                .as_ref()
+                .is_some_and(|token| Arc::ptr_eq(token, &request.token))
+        {
+            return false;
+        }
+
+        // Only the matching physical completion releases the borrowed slot.
+        // A stale matching completion releases it without publishing.
+        self.recovery_job = None;
+        self.receipt_worker = None;
+        let pending = self.pending_recovery.take();
+        if !pending
+            .as_ref()
+            .is_some_and(|pending| pending.same_request(&request))
+            || !self.recovery_scope_current(&request)
+        {
+            return false;
+        }
+
+        match result {
+            RecoveryResult::Inspection(inspection) => match inspection {
+                Ok(inspection) => self.recovery_inspection = Some(inspection),
+                Err(error) => self.recovery_error = Some(error),
+            },
+            RecoveryResult::Preview(approval) => match approval {
+                Ok(approval) => {
+                    // Both readings came from this selected product scope.
+                    // Canonical-root disagreement requires another inspection.
+                    if self
+                        .recovery_inspection
+                        .as_ref()
+                        .is_none_or(|inspection| inspection.root != approval.root())
+                    {
+                        self.recovery_inspection = None;
+                        self.recovery_error =
+                            Some("The AddOns folder changed. Inspect recovery again.".into());
+                    } else {
+                        self.recovery_preview = Some(RecoveryPreview { request, approval });
+                    }
+                }
+                Err(error) => self.recovery_error = Some(error),
+            },
+            RecoveryResult::Restore {
+                outcome,
+                inspection,
+            } => {
+                // Keep the restore result even when post-inspection failed.
+                self.recovery_outcome = Some(outcome);
+                match inspection {
+                    Ok(inspection) => self.recovery_inspection = Some(inspection),
+                    Err(error) => self.recovery_post_error = Some(error),
+                }
+            }
+        }
+        true
+    }
+
+    fn recovery_status(&self) -> Option<&'static str> {
+        self.recovery_job.as_ref().map(|job| match &job.action {
+            RecoveryAction::Inspect => "Reading recovery state...",
+            RecoveryAction::Preview => "Checking the restore plan...",
+            RecoveryAction::Restore(_) => {
+                "Restoring originals and checking the result. Keep Patchloom open and wait before changing folders."
+            }
+        })
+    }
+
+    fn set_recovery_page(&mut self, preview: &RecoveryPreview, page: usize) {
+        if self.recovery_slot_available() && self.current_recovery_preview(preview) {
+            let count = preview
+                .approval
+                .originals()
+                .len()
+                .max(preview.approval.move_aside_if_present().len());
+            let last = count.saturating_sub(1) / FOLDERS_SHOWN;
+            self.recovery_page = page.min(last);
+        }
+    }
+
     fn needs_review(&self) -> bool {
         self.error.is_some()
             || self.inventory.as_ref().is_none_or(|report| {
@@ -482,6 +848,57 @@ fn receipt_snapshot(
         .map(Arc::new)
         .map_err(|error| error.to_string())
 }
+// Added 2026-10-28; original GPLv3 applies.
+fn recovery_snapshot(request: &RecoveryRequest) -> RecoveryResult {
+    match &request.action {
+        RecoveryAction::Inspect => RecoveryResult::Inspection(
+            ajour_core::fs::inspect_recovery(&request.addons)
+                .map(Arc::new)
+                .map_err(|error| error.to_string()),
+        ),
+        RecoveryAction::Preview => RecoveryResult::Preview(
+            ajour_core::fs::preflight_restore_originals(&request.addons)
+                .map(Arc::new)
+                .map_err(|error| error.to_string()),
+        ),
+        RecoveryAction::Restore(approval) => {
+            // Reaching this worker means fresh explicit consent was admitted
+            // synchronously. Never show a dialog or wait under the core lock.
+            let outcome = ajour_core::fs::restore_originals_checked(
+                &request.addons,
+                approval.as_ref(),
+                |originals, move_aside| {
+                    originals == approval.originals()
+                        && move_aside == approval.move_aside_if_present()
+                },
+            )
+            .map_err(|error| error.to_string());
+
+            // Run after every checked call, including Err. Completion is not
+            // delivered, and physical GUI capacity is not released, until
+            // this inspection finishes.
+            let inspection = ajour_core::fs::inspect_recovery(&request.addons)
+                .map(Arc::new)
+                .map_err(|error| error.to_string());
+            RecoveryResult::Restore {
+                outcome,
+                inspection,
+            }
+        }
+    }
+}
+
+fn recovery_command(request: RecoveryRequest) -> Command<Message> {
+    Command::perform(
+        async move {
+            let worker = request.clone();
+            let result = async_std::task::spawn_blocking(move || recovery_snapshot(&worker)).await;
+            (request, result)
+        },
+        |(request, result)| Message::RecoveryDone(request, result),
+    )
+}
+
 fn scan_command(request: ScanRequest) -> Command<Message> {
     Command::perform(
         async move {
@@ -667,12 +1084,361 @@ enum Message {
     CheckRelease,
     ReleaseDone(ReleaseRequest, Result<String, String>),
     ReleaseRateLimited(ReleaseRequest, RetryDeadline),
+    InspectRecovery,
+    PreviewRecovery,
+    RecoveryAckChanged(RecoveryPreview, String),
+    RecoveryPage(RecoveryPreview, usize),
+    RecoveryRootPage(RecoveryPreview, usize),
+    CancelRecoveryPreview(RecoveryPreview),
+    RestoreRecovery(RecoveryPreview),
+    RecoveryDone(RecoveryRequest, RecoveryResult),
     NativeCheckDone,
 }
 struct Flags {
     root: PathBuf,
     native_check: bool,
 }
+// Added 2026-10-28; original GPLv3 applies.
+// Added 2026-10-28; original GPLv3 applies.
+fn recovery_root_pages(root: &std::path::Path) -> usize {
+    // OS-string debug formatting preserves non-UTF-8 path distinctions.
+    // Page the representation, not a lossy or clipped approval root.
+    let text = format!("{:?}", root.as_os_str());
+    text.chars().count().saturating_sub(1) / ERROR_CHARS + 1
+}
+
+fn recovery_root_chunk(root: &std::path::Path, page: usize) -> String {
+    let page = page.min(recovery_root_pages(root).saturating_sub(1));
+    let text = format!("{:?}", root.as_os_str());
+
+    // Bound input characters before escaping. escape_default emits ASCII,
+    // including visible escapes for controls, bidi characters and backslashes.
+    // The complete path remains accessible across pages.
+    text.chars()
+        .skip(page.saturating_mul(ERROR_CHARS))
+        .take(ERROR_CHARS)
+        .flat_map(char::escape_default)
+        .collect()
+}
+
+fn recovery_folder_page(folders: &[String], page: usize) -> String {
+    if folders.is_empty() {
+        return "None.".into();
+    }
+
+    let start = page.saturating_mul(FOLDERS_SHOWN);
+    let lines: Vec<_> = folders
+        .iter()
+        .skip(start)
+        .take(FOLDERS_SHOWN)
+        .enumerate()
+        .map(|(offset, name)| {
+            // Approval names have already passed core's 255-byte component
+            // validation. Escape each complete name; do not use FOLDER_CHARS.
+            let name: String = name.chars().flat_map(char::escape_default).collect();
+            format!(
+                "{}. \"{}\"",
+                start.saturating_add(offset).saturating_add(1),
+                name
+            )
+        })
+        .collect();
+
+    if lines.is_empty() {
+        "No folders on this page.".into()
+    } else {
+        lines.join("\n")
+    }
+}
+
+fn recovery_outcome_text(
+    outcome: &Result<ajour_core::fs::RecoveryRestoreOutcome, String>,
+) -> String {
+    use ajour_core::fs::RecoveryRestoreOutcome;
+
+    match outcome {
+        Ok(RecoveryRestoreOutcome::Cancelled) => {
+            "Restore cancelled. No addon folders were changed.".into()
+        }
+        Ok(RecoveryRestoreOutcome::Changed) => {
+            "Recovery state changed. No restore was started. Inspect recovery and preview a new plan before confirming again.".into()
+        }
+        Ok(RecoveryRestoreOutcome::RestoredRetained) => {
+            "Original folders restored. Replacement folders and recovery journals are retained. Updates remain blocked pending cleanup.".into()
+        }
+        Err(error) => format!(
+            "Restore failed: {}. Some folders may already have moved. Review the recovery state before trying again.",
+            clip(error, ERROR_CHARS)
+        ),
+    }
+}
+
+struct RecoveryControls {
+    inspect: button::State,
+    preview: button::State,
+    restore: button::State,
+    cancel: button::State,
+    previous: button::State,
+    next: button::State,
+    root_previous: button::State,
+    root_next: button::State,
+    acknowledgement: text_input::State,
+    root_page: usize,
+}
+
+impl RecoveryControls {
+    fn new() -> Self {
+        Self {
+            inspect: button::State::new(),
+            preview: button::State::new(),
+            restore: button::State::new(),
+            cancel: button::State::new(),
+            previous: button::State::new(),
+            next: button::State::new(),
+            root_previous: button::State::new(),
+            root_next: button::State::new(),
+            acknowledgement: text_input::State::new(),
+            root_page: 0,
+        }
+    }
+}
+
+// Added 2026-10-28; original GPLv3 applies.
+impl RecoveryControls {
+    fn view<'a>(&'a mut self, model: &'a Model, root_edited: bool) -> Element<'a, Message> {
+        let mut inspect = Button::new(&mut self.inspect, Text::new("Inspect recovery"));
+        if !root_edited && model.can_inspect_recovery() {
+            inspect = inspect.on_press(Message::InspectRecovery);
+        }
+
+        let mut preview_button = Button::new(&mut self.preview, Text::new("Preview restore"));
+        if !root_edited && model.can_preview_recovery() {
+            preview_button = preview_button.on_press(Message::PreviewRecovery);
+        }
+
+        let mut content = Column::new()
+            .spacing(10)
+            .push(Text::new("Recovery").size(22))
+            .push(Text::new(
+                "Inspection and preview do not change files. Restoring originals moves addon folders.",
+            ))
+            .push(
+                Row::new()
+                    .spacing(12)
+                    .push(inspect)
+                    .push(preview_button),
+            );
+
+        if let Some(product) = model.selected {
+            content = content.push(Text::new(format!(
+                "Recovery WoW version: {}",
+                product_label(product)
+            )));
+        }
+
+        if let Some(status) = model.recovery_status() {
+            content = content.push(Text::new(status));
+        }
+
+        if let Some(error) = &model.recovery_error {
+            content = content
+                .push(Text::new("Recovery message:"))
+                .push(Text::new(clip(error, ERROR_CHARS)).size(14));
+        }
+
+        if let Some(outcome) = &model.recovery_outcome {
+            content = content
+                .push(Text::new("Restore result").size(18))
+                .push(Text::new(recovery_outcome_text(outcome)))
+                .push(Text::new(
+                    "Rescan folder to refresh inventory before another recovery check.",
+                ));
+        }
+
+        if let Some(error) = &model.recovery_post_error {
+            content = content
+                .push(Text::new(
+                    "The follow-up recovery check failed. The restore result above still applies, but the current recovery state could not be read.",
+                ))
+                .push(Text::new(clip(error, ERROR_CHARS)).size(14));
+        }
+
+        if let Some(inspection) = &model.recovery_inspection {
+            content = content
+                .push(Text::new("Recovery inspection").size(18))
+                .push(
+                    Text::new(format!(
+                        "AddOns path summary: {}",
+                        clip(&format!("{:?}", inspection.root.as_os_str()), ERROR_CHARS)
+                    ))
+                    .size(14),
+                );
+
+            if inspection.phase == "none" {
+                content = content.push(Text::new("No recovery journal was found."));
+            } else {
+                content = content
+                    .push(Text::new(format!(
+                        "Journal phase: {}",
+                        clip(&inspection.phase, SOURCE_FIELD_CHARS)
+                    )))
+                    .push(Text::new(format!(
+                        "Recorded original folders: {}; incoming folders: {}.",
+                        inspection.previous.len(),
+                        inspection.incoming.len()
+                    )))
+                    .push(Text::new(format!(
+                        "Backups found: {}; staged folders: {}; affected destinations present: {}.",
+                        inspection.backups.len(),
+                        inspection.staged.len(),
+                        inspection.destinations.len()
+                    )));
+            }
+
+            if let Some(phase) = &inspection.restore_phase {
+                content = content.push(Text::new(format!(
+                    "Restore phase: {}",
+                    clip(phase, SOURCE_FIELD_CHARS)
+                )));
+            }
+
+            content = content
+                .push(Text::new(format!(
+                    "Retained replacement folders: {}.",
+                    inspection.retained_replacements.len()
+                )))
+                .push(Text::new(
+                    "This inspection does not authorize a restore. Preview restore checks whether a restore plan is available.",
+                ));
+        }
+
+        if let Some(preview) = model
+            .recovery_preview
+            .as_ref()
+            .filter(|preview| model.current_recovery_preview(preview))
+        {
+            let ready = !root_edited && model.recovery_slot_available();
+            let root_pages = recovery_root_pages(preview.approval.root());
+            let root_page = self.root_page.min(root_pages.saturating_sub(1));
+            let count = preview
+                .approval
+                .originals()
+                .len()
+                .max(preview.approval.move_aside_if_present().len());
+            let pages = count.saturating_sub(1) / FOLDERS_SHOWN + 1;
+            let page = model.recovery_page.min(pages.saturating_sub(1));
+
+            content = content
+                .push(Text::new("Restore plan").size(18))
+                .push(Text::new(format!(
+                    "WoW version: {}",
+                    product_label(preview.request.product)
+                )))
+                .push(Text::new(format!(
+                    "AddOns path, part {} of {} (escaped):",
+                    root_page + 1,
+                    root_pages
+                )))
+                .push(Text::new(recovery_root_chunk(
+                    preview.approval.root(),
+                    root_page,
+                )).size(14))
+                .push(Text::new(
+                    "The path includes its recorded quotes and escapes. Each part continues the previous one.",
+                ));
+
+            let mut root_previous =
+                Button::new(&mut self.root_previous, Text::new("Previous path part"));
+            if ready && root_page > 0 {
+                root_previous = root_previous
+                    .on_press(Message::RecoveryRootPage(preview.clone(), root_page - 1));
+            }
+
+            let mut root_next = Button::new(&mut self.root_next, Text::new("Next path part"));
+            if ready && root_page + 1 < root_pages {
+                root_next =
+                    root_next.on_press(Message::RecoveryRootPage(preview.clone(), root_page + 1));
+            }
+
+            content = content
+                .push(Row::new().spacing(12).push(root_previous).push(root_next))
+                .push(Text::new(format!(
+                    "Folder page {} of {}. Names use quoted escapes.",
+                    page + 1,
+                    pages
+                )))
+                .push(Text::new(format!(
+                    "Original folders to restore ({}):",
+                    preview.approval.originals().len()
+                )))
+                .push(Text::new(recovery_folder_page(preview.approval.originals(), page)).size(14))
+                .push(Text::new(format!(
+                    "Current folder names checked by this plan ({}):",
+                    preview.approval.move_aside_if_present().len()
+                )))
+                .push(
+                    Text::new(recovery_folder_page(
+                        preview.approval.move_aside_if_present(),
+                        page,
+                    ))
+                    .size(14),
+                );
+
+            let mut previous = Button::new(&mut self.previous, Text::new("Previous folder page"));
+            if ready && page > 0 {
+                previous = previous.on_press(Message::RecoveryPage(preview.clone(), page - 1));
+            }
+
+            let mut next = Button::new(&mut self.next, Text::new("Next folder page"));
+            if ready && page + 1 < pages {
+                next = next.on_press(Message::RecoveryPage(preview.clone(), page + 1));
+            }
+
+            content = content
+                .push(Row::new().spacing(12).push(previous).push(next))
+                .push(Text::new(
+                    "Folders moved aside are kept. A resumed restore continues from its recorded stage. Replacement folders and recovery journals remain; updates stay blocked pending cleanup.",
+                ))
+                .push(Text::new(
+                    "WTF, SavedVariables and unrelated addons are outside this restore.",
+                ))
+                .push(Text::new(
+                    "Type RESTORE for this plan, then click Restore originals. Keep Patchloom open until restoration finishes.",
+                ));
+
+            if ready {
+                let acknowledged_preview = preview.clone();
+                content = content.push(TextInput::new(
+                    &mut self.acknowledgement,
+                    "RESTORE",
+                    &model.recovery_ack,
+                    move |answer| Message::RecoveryAckChanged(acknowledged_preview.clone(), answer),
+                ));
+            } else {
+                // No editable acknowledgement or actionable confirmation while
+                // another physical filesystem job owns the shared slot.
+                content = content.push(Text::new(
+                    "Wait for the current folder check to finish before confirming.",
+                ));
+            }
+
+            let mut restore = Button::new(&mut self.restore, Text::new("Restore originals"));
+            if !root_edited && model.can_restore_recovery(preview) {
+                restore = restore.on_press(Message::RestoreRecovery(preview.clone()));
+            }
+
+            let mut cancel = Button::new(&mut self.cancel, Text::new("Cancel preview"));
+            if ready {
+                cancel = cancel.on_press(Message::CancelRecoveryPreview(preview.clone()));
+            }
+
+            content = content.push(Row::new().spacing(12).push(restore).push(cancel));
+        }
+
+        content.into()
+    }
+}
+
 struct Preview {
     model: Model,
     root_input: String,
@@ -685,6 +1451,7 @@ struct Preview {
     inspect: button::State,
     repository_input: text_input::State,
     check_release: button::State,
+    recovery: RecoveryControls,
     scroll: scrollable::State,
     native_check: bool,
     exit: bool,
@@ -704,6 +1471,7 @@ impl Preview {
             inspect: button::State::new(),
             repository_input: text_input::State::new(),
             check_release: button::State::new(),
+            recovery: RecoveryControls::new(),
             scroll: scrollable::State::new(),
             native_check,
             exit: false,
@@ -711,17 +1479,30 @@ impl Preview {
         app.synchronize_choices();
         app
     }
+    // Modified 2026-10-28; original GPLv3 applies.
     fn dispatch(&mut self, message: Message) -> Command<Message> {
+        if self.model.restoring()
+            && matches!(
+                &message,
+                Message::RootInputChanged(_)
+                    | Message::OpenRoot
+                    | Message::Select(_)
+                    | Message::Rescan
+            )
+        {
+            return Command::none();
+        }
+
         match message {
             Message::RootInputChanged(input) => {
                 if self.root_input != input {
                     self.root_input = input;
                     self.root_edited = true;
                     self.model.invalidate_snapshot();
+                    self.recovery.root_page = 0;
                     self.synchronize_choices();
                 }
-                // Typing also cancels any queued scan. An old physical worker
-                // keeps its reservation until its matching completion arrives.
+                // Logical invalidation does not release physical capacity.
                 return Command::none();
             }
             Message::OpenRoot => {
@@ -732,16 +1513,24 @@ impl Preview {
                 };
                 self.model.set_root(root);
                 self.root_edited = false;
+                self.recovery.root_page = 0;
                 let request = self.model.begin_scan();
                 self.synchronize_choices();
                 return request.map_or_else(Command::none, scan_command);
             }
-            Message::Select(product) => self.model.select(product),
+            Message::Select(product) => {
+                let selected = self.model.selected;
+                self.model.select(product);
+                if self.model.selected != selected {
+                    self.recovery.root_page = 0;
+                }
+            }
             Message::Rescan => {
                 if self.root_edited {
                     return Command::none();
                 }
                 let request = self.model.begin_scan();
+                self.recovery.root_page = 0;
                 self.synchronize_choices();
                 return request.map_or_else(Command::none, scan_command);
             }
@@ -773,9 +1562,79 @@ impl Preview {
             Message::ReleaseRateLimited(request, deadline) => {
                 self.model.complete_release_rate_limited(request, deadline);
             }
-
+            Message::InspectRecovery => {
+                if !self.root_edited {
+                    if let Some(request) = self.model.begin_recovery(false) {
+                        self.recovery.root_page = 0;
+                        return recovery_command(request);
+                    }
+                }
+            }
+            Message::PreviewRecovery => {
+                if !self.root_edited {
+                    if let Some(request) = self.model.begin_recovery(true) {
+                        self.recovery.root_page = 0;
+                        return recovery_command(request);
+                    }
+                }
+            }
+            Message::RecoveryAckChanged(preview, answer) => {
+                if !self.root_edited {
+                    // Bound inspection of input, with no prefix acceptance.
+                    let answer = if answer.chars().take(8).count() <= 7 {
+                        answer
+                    } else {
+                        String::new()
+                    };
+                    self.model.set_recovery_ack(&preview, answer);
+                }
+            }
+            Message::RecoveryPage(preview, page) => {
+                if !self.root_edited {
+                    self.model.set_recovery_page(&preview, page);
+                }
+            }
+            Message::RecoveryRootPage(preview, page) => {
+                if !self.root_edited
+                    && self.model.recovery_slot_available()
+                    && self.model.current_recovery_preview(&preview)
+                {
+                    self.recovery.root_page =
+                        page.min(recovery_root_pages(preview.approval.root()).saturating_sub(1));
+                }
+            }
+            Message::CancelRecoveryPreview(preview) => {
+                if !self.root_edited
+                    && self.model.recovery_slot_available()
+                    && self.model.current_recovery_preview(&preview)
+                {
+                    self.model.cancel_recovery_preview(&preview);
+                    self.recovery.root_page = 0;
+                }
+            }
+            Message::RestoreRecovery(preview) => {
+                if !self.root_edited {
+                    if let Some(request) = self.model.begin_restore_recovery(&preview) {
+                        self.recovery.root_page = 0;
+                        self.synchronize_choices();
+                        return recovery_command(request);
+                    }
+                }
+            }
+            Message::RecoveryDone(request, result) => {
+                // Matching completion releases physical capacity inside Model.
+                // Invalidated results cannot publish or reset current controls.
+                if self.model.complete_recovery(request, result) {
+                    self.recovery.root_page = 0;
+                    self.synchronize_choices();
+                }
+            }
             Message::NativeCheckDone => {
-                if self.model.scan.is_none() && !self.model.scan_requested {
+                if self.model.scan.is_none()
+                    && !self.model.scan_requested
+                    && self.model.receipt_worker.is_none()
+                    && self.model.recovery_job.is_none()
+                {
                     self.exit = true;
                 }
             }
@@ -831,9 +1690,37 @@ impl Application for Preview {
     fn update(&mut self, message: Message, _: &mut Clipboard) -> Command<Message> {
         self.dispatch(message)
     }
+    // Modified 2026-10-28; original GPLv3 applies.
     fn view(&mut self) -> Element<'_, Message> {
+        let restoring = self.model.restoring();
+
+        // Do not offer editable scope controls during restore or post-inspection.
+        // Dispatch independently rejects these actions for the same interval.
+        let root_input: Element<'_, Message> = if restoring {
+            Text::new(clip(
+                &format!("{:?}", self.model.root.as_os_str()),
+                ERROR_CHARS,
+            ))
+            .width(Length::Fill)
+            .into()
+        } else {
+            TextInput::new(
+                &mut self.root_input_state,
+                "Copied World of Warcraft folder",
+                &self.root_input,
+                Message::RootInputChanged,
+            )
+            .width(Length::Fill)
+            .into()
+        };
+
+        let mut open = Button::new(&mut self.open_root, Text::new("Open"));
+        if !restoring {
+            open = open.on_press(Message::OpenRoot);
+        }
+
         let mut rescan = Button::new(&mut self.rescan, Text::new("Rescan folder"));
-        if !self.root_edited && !self.model.root.as_os_str().is_empty() {
+        if !restoring && !self.root_edited && !self.model.root.as_os_str().is_empty() {
             rescan = rescan.on_press(Message::Rescan);
         }
 
@@ -841,32 +1728,22 @@ impl Application for Preview {
             .spacing(14)
             .push(Text::new("Patchloom").size(32))
             .push(Text::new("WoW addon inventory").size(22))
-            .push(Text::new("Read-only preview. Your files will not be changed.").size(16))
+            .push(Text::new(
+                "Inventory and receipt checks do not change files. Restore originals requires a reviewed plan and confirmation.",
+            ).size(16))
             .push(Text::new(
                 "Development build. Enter a copied WoW folder path, then click Open.",
             ))
-            .push(
-                Row::new()
-                    .spacing(12)
-                    .push(
-                        TextInput::new(
-                            &mut self.root_input_state,
-                            "Copied World of Warcraft folder",
-                            &self.root_input,
-                            Message::RootInputChanged,
-                        )
-                        .width(Length::Fill),
-                    )
-                    .push(
-                        Button::new(&mut self.open_root, Text::new("Open"))
-                            .on_press(Message::OpenRoot),
-                    ),
-            )
+            .push(Row::new().spacing(12).push(root_input).push(open))
             .push(rescan);
 
         if !self.root_edited && !self.model.root.as_os_str().is_empty() {
             content = content.push(
-                Text::new(clip(&self.model.root.display().to_string(), ERROR_CHARS)).size(14),
+                Text::new(clip(
+                    &format!("{:?}", self.model.root.as_os_str()),
+                    ERROR_CHARS,
+                ))
+                .size(14),
             );
         }
         if let Some(status) = self.model.scan_status() {
@@ -884,38 +1761,47 @@ impl Application for Preview {
                 .push(Text::new(
                     "Check that the copied World of Warcraft folder is complete and readable.",
                 ))
-                .push(Text::new(error).size(14));
+                .push(Text::new(clip(error, ERROR_CHARS)).size(14));
         }
+
         if let Some(report) = &self.model.inventory {
             if report.installations.is_empty() {
                 content =
                     content.push(Text::new("No supported WoW versions found in this folder."));
             }
             for issue in &report.issues {
-                content = content.push(Text::new(issue_text(issue)).size(15));
+                content = content.push(Text::new(clip(&issue_text(issue), ERROR_CHARS)).size(15));
             }
             for (installation, state) in report.installations.iter().zip(&mut self.choices) {
                 let label = format!(
                     "{}  {}",
                     product_label(installation.product),
-                    installation.version
+                    clip(&installation.version, SOURCE_FIELD_CHARS)
                 );
-                content = content.push(
-                    Button::new(state, Text::new(label))
-                        .on_press(Message::Select(installation.product)),
-                );
+                let mut choice = Button::new(state, Text::new(label));
+                if !restoring && !self.root_edited {
+                    choice = choice.on_press(Message::Select(installation.product));
+                }
+                content = content.push(choice);
             }
+
             if let Some(installation) = self.model.installation() {
                 content = content
                     .push(
                         Text::new(format!(
                             "{} {}",
                             product_label(installation.product),
-                            installation.version
+                            clip(&installation.version, SOURCE_FIELD_CHARS)
                         ))
                         .size(22),
                     )
-                    .push(Text::new(installation.directory.display().to_string()).size(14))
+                    .push(
+                        Text::new(clip(
+                            &format!("{:?}", installation.directory.as_os_str()),
+                            ERROR_CHARS,
+                        ))
+                        .size(14),
+                    )
                     .push(Text::new(format!(
                         "Addon folders: {}",
                         installation.addons.len()
@@ -934,21 +1820,27 @@ impl Application for Preview {
                     content = content.push(
                         Row::new()
                             .spacing(20)
-                            .push(Text::new(&addon.addon).width(Length::FillPortion(1)))
+                            .push(
+                                Text::new(clip(&addon.addon, FOLDER_CHARS))
+                                    .width(Length::FillPortion(1)),
+                            )
                             .push(Text::new(status).width(Length::FillPortion(3))),
                     );
                 }
+
                 content = content
                     .push(Text::new("GitHub release check").size(18))
                     .push(Text::new(
                         "Enter a public GitHub owner/repository. Check release contacts GitHub.",
-                    ))
-                    .push(TextInput::new(
+                    ));
+                if !restoring {
+                    content = content.push(TextInput::new(
                         &mut self.repository_input,
                         "owner/repository",
                         &self.model.repository,
                         Message::RepositoryChanged,
                     ));
+                }
                 match self.model.release_retry_at {
                     Some(RetryDeadline::Blocked) => {
                         content = content.push(Text::new(
@@ -975,7 +1867,9 @@ impl Application for Preview {
                 }
 
                 let mut check = Button::new(&mut self.check_release, Text::new("Check release"));
-                if self.model.release_inputs_ready() {
+                // Keep the existing manual-click behavior during a displayed wait.
+                // begin_release remains authoritative and refuses early requests.
+                if !self.root_edited && !restoring && self.model.release_inputs_ready() {
                     check = check.on_press(Message::CheckRelease);
                 }
                 content = content
@@ -1014,7 +1908,7 @@ impl Application for Preview {
                         Some(Err(error)) => {
                             content = content
                                 .push(Text::new("We couldn't check this release."))
-                                .push(Text::new(error).size(14))
+                                .push(Text::new(clip(error, ERROR_CHARS)).size(14))
                                 .push(Text::new(
                                     "Review the error before trying Check release again. Any active rate-limit wait still applies. Local inventory and receipt checks remain available.",
                                 ));
@@ -1024,19 +1918,22 @@ impl Application for Preview {
                         }
                     }
                 }
+
                 content = content
                     .push(Text::new("Ownership receipt").size(18))
                     .push(Text::new(
-                        "Enter a receipt ID to check its recorded folders against this WoW version.",
-                    ))
-                    .push(TextInput::new(
+                    "Enter a receipt ID to check its recorded folders against this WoW version.",
+                ));
+                if !restoring {
+                    content = content.push(TextInput::new(
                         &mut self.receipt_input,
                         "Receipt ID",
                         &self.model.receipt_id,
                         Message::ReceiptIdChanged,
                     ));
+                }
                 let mut inspect = Button::new(&mut self.inspect, Text::new("Check receipt"));
-                if self.model.can_inspect_receipt() {
+                if !self.root_edited && !restoring && self.model.can_inspect_receipt() {
                     inspect = inspect.on_press(Message::InspectReceipt);
                 }
                 content = content.push(inspect).push(Text::new(
@@ -1063,7 +1960,14 @@ impl Application for Preview {
                     content.push(Text::new("Choose a WoW version to view its addon folders."));
             }
         }
-        // Reuse existing neutral project surfaces; no unapproved logo or palette adaptation.
+
+        // Keep recovery outside the inventory branch: restore admission clears
+        // inventory, but progress, outcome and post-inspection must stay visible.
+        // RecoveryControls pages the complete canonical approval root and both
+        // complete folder slices. Host summaries above are not approval scope.
+        content = content.push(self.recovery.view(&self.model, self.root_edited));
+
+        // Reuse existing neutral project surfaces without changing approved art.
         let palette = ajour_core::theme::Theme::dark().palette;
         Container::new(Scrollable::new(&mut self.scroll).padding(24).push(content))
             .style(Surface(palette))
@@ -1086,6 +1990,9 @@ impl container::StyleSheet for Surface {
 // Added 2026-10-28; original GPLv3 applies.
 // Runs the actual Application constructor and local completion dispatch.
 // Does not start a native application, executor, subscription or clipboard.
+// Modified 2026-10-28; original GPLv3 applies.
+// Runs the actual Application constructor and local completion dispatch.
+// Does not start a native application, executor, subscription or clipboard.
 fn check_startup(root: PathBuf, explicit_root: bool) -> crate::Result<()> {
     let empty_root = root.as_os_str().is_empty();
     let (mut app, command) = Preview::new(Flags {
@@ -1096,17 +2003,30 @@ fn check_startup(root: PathBuf, explicit_root: bool) -> crate::Result<()> {
     let initial_commands = futures.len();
     let expected_commands = if empty_root { 0 } else { 1 };
 
+    let no_recovery_work = |model: &Model| {
+        model.recovery_job.is_none()
+            && model.pending_recovery.is_none()
+            && model.recovery_inspection.is_none()
+            && model.recovery_preview.is_none()
+            && model.recovery_ack.is_empty()
+            && model.recovery_page == 0
+            && model.recovery_error.is_none()
+            && model.recovery_outcome.is_none()
+            && model.recovery_post_error.is_none()
+    };
+
     if initial_commands != expected_commands
         || app.model.receipt_worker.is_some()
         || app.model.release_worker.is_some()
         || app.model.pending_release.is_some()
+        || !no_recovery_work(&app.model)
     {
         anyhow::bail!("Unexpected work during safe startup");
     }
 
     if empty_root && explicit_root {
-        // An explicitly supplied empty path is invalid, not a request to
-        // discover the working directory or accept the rootless landing.
+        // An explicitly supplied empty path must not discover the working
+        // directory or count as a successful rootless landing.
         if !app.dispatch(Message::OpenRoot).futures().is_empty() {
             anyhow::bail!("Unexpected work for an empty WoW path");
         }
@@ -1126,6 +2046,14 @@ fn check_startup(root: PathBuf, explicit_root: bool) -> crate::Result<()> {
     }
 
     drop(app.view());
+    if !no_recovery_work(&app.model)
+        || app.model.receipt_worker.is_some()
+        || app.model.release_worker.is_some()
+        || app.model.pending_release.is_some()
+    {
+        anyhow::bail!("Unexpected recovery or provider work after startup");
+    }
+
     serde_json::to_writer(
         std::io::stdout(),
         &serde_json::json!({
@@ -2712,6 +3640,2009 @@ mod tests {
             drop(app.view());
             for (path, bytes) in paths.iter().zip(&before) {
                 assert_eq!(&std::fs::read(path).unwrap(), bytes);
+            }
+        }
+    }
+
+    // Added 2026-10-28; original GPLv3 applies.
+    mod recovery_dispatch_tests {
+        use super::*;
+        use ajour_core::fs::{
+            preflight_restore_originals, restore_originals_checked,
+            RecoveryRestoreOutcome as Outcome,
+        };
+        use std::{collections::BTreeMap, fs, path::Path};
+
+        #[derive(Debug, PartialEq, Eq)]
+        enum Entry {
+            Directory,
+            File(Vec<u8>),
+            Link(PathBuf),
+        }
+
+        // Complete fixture membership/types/bytes, including empty directories.
+        // Never follows links. Call only before work or after its future finishes,
+        // and never while this test holds the root mutex.
+        fn tree(root: &Path) -> BTreeMap<PathBuf, Entry> {
+            fn visit(root: &Path, path: &Path, entries: &mut BTreeMap<PathBuf, Entry>) {
+                let metadata = fs::symlink_metadata(path).unwrap();
+                let link = metadata.file_type().is_symlink();
+                #[cfg(windows)]
+                let link = {
+                    use std::os::windows::fs::MetadataExt;
+                    link || metadata.file_attributes() & 0x400 != 0
+                };
+                let entry = if link {
+                    Entry::Link(fs::read_link(path).unwrap())
+                } else if metadata.is_dir() {
+                    Entry::Directory
+                } else {
+                    assert!(metadata.is_file(), "unexpected fixture entry type");
+                    Entry::File(fs::read(path).unwrap())
+                };
+                let directory = matches!(&entry, Entry::Directory);
+                entries.insert(path.strip_prefix(root).unwrap().into(), entry);
+                if directory {
+                    for child in fs::read_dir(path).unwrap() {
+                        visit(root, &child.unwrap().path(), entries);
+                    }
+                }
+            }
+
+            let mut entries = BTreeMap::new();
+            visit(root, root, &mut entries);
+            entries
+        }
+
+        fn no_command(command: Command<Message>) {
+            assert!(command.futures().is_empty());
+        }
+
+        // Call only with local constructor/scan/receipt/recovery commands.
+        // Never pass CheckRelease: no provider future is polled by these tests.
+        fn local_message(command: Command<Message>) -> Message {
+            let mut futures = command.futures();
+            assert_eq!(futures.len(), 1);
+            let message = async_std::task::block_on(futures.remove(0));
+            assert!(matches!(
+                &message,
+                Message::InventoryDone(..) | Message::ReceiptDone(..) | Message::RecoveryDone(..)
+            ));
+            message
+        }
+
+        fn finish(app: &mut Preview, command: Command<Message>) {
+            let message = local_message(command);
+            no_command(app.dispatch(message));
+        }
+
+        fn owns(app: &Preview, request: &RecoveryRequest) {
+            assert!(app
+                .model
+                .recovery_job
+                .as_ref()
+                .is_some_and(|job| job.same_request(request)));
+            assert!(app
+                .model
+                .receipt_worker
+                .as_ref()
+                .is_some_and(|token| Arc::ptr_eq(token, &request.token)));
+        }
+
+        fn fixture(interrupted: bool) -> (tempfile::TempDir, tempfile::TempDir, Preview, PathBuf) {
+            let (wow, model) = release_fixture();
+            let data = tempfile::tempdir().unwrap();
+            fs::create_dir(data.path().join("config")).unwrap();
+            fs::write(
+                data.path().join("config/settings.json"),
+                b"{\"fixture\":\"preserve\"}\0\n",
+            )
+            .unwrap();
+
+            // Selected WoW root and canonical AddOns root are different scopes.
+            let addons = model
+                .installation()
+                .unwrap()
+                .directory
+                .join("Interface")
+                .join("AddOns")
+                .canonicalize()
+                .unwrap();
+
+            for directory in [
+                wow.path().join("_retail_/WTF/Account/SavedVariables"),
+                addons.join("WTF"),
+                addons.join("SavedVariables"),
+                addons.join("Unrelated"),
+            ] {
+                fs::create_dir_all(&directory).unwrap();
+                fs::write(directory.join("keep.lua"), b"unrelated settings\0\n").unwrap();
+            }
+
+            if interrupted {
+                let transaction = addons.join(".patchloom-install");
+                fs::create_dir_all(transaction.join("backup/Bar")).unwrap();
+                fs::create_dir(transaction.join("backup/Foo")).unwrap();
+                fs::create_dir(transaction.join("staged")).unwrap();
+                // Same accepted journal format as the supplied CLI/core fixtures.
+                fs::write(
+                    transaction.join("plan.yml"),
+                    b"version: 1\nprevious: [Bar, Foo]\nincoming: [Foo, New]\n",
+                )
+                .unwrap();
+                fs::write(transaction.join("ready"), b"").unwrap();
+                fs::write(transaction.join("backup/Bar/old.lua"), b"original-bar").unwrap();
+                fs::write(transaction.join("backup/Foo/old.lua"), b"original").unwrap();
+                for (name, bytes) in [
+                    ("Foo", b"replacement".as_slice()),
+                    ("New", b"additional".as_slice()),
+                ] {
+                    fs::create_dir(addons.join(name)).unwrap();
+                    fs::write(addons.join(name).join("new.lua"), bytes).unwrap();
+                }
+                // Nonempty mutex bytes are included in test inventories, but
+                // are deliberately not approval authority.
+                fs::write(
+                    addons.join(".patchloom-install.lock"),
+                    b"fixture mutex bytes\n",
+                )
+                .unwrap();
+            }
+
+            (wow, data, Preview::from_model(model, false), addons)
+        }
+
+        fn plan(app: &mut Preview) -> RecoveryPreview {
+            let command = app.dispatch(Message::InspectRecovery);
+            let request = app.model.pending_recovery.as_ref().unwrap().clone();
+            owns(app, &request);
+            assert!(matches!(&request.action, RecoveryAction::Inspect));
+            assert!(app.model.scan.is_none());
+            finish(app, command);
+            assert!(app.model.recovery_error.is_none());
+            assert!(app.model.recovery_inspection.is_some());
+
+            let command = app.dispatch(Message::PreviewRecovery);
+            let request = app.model.pending_recovery.as_ref().unwrap().clone();
+            owns(app, &request);
+            assert!(matches!(&request.action, RecoveryAction::Preview));
+            finish(app, command);
+            assert!(app.model.recovery_error.is_none());
+            assert!(app.model.pending_recovery.is_none());
+            assert!(app.model.recovery_job.is_none());
+            assert!(app.model.receipt_worker.is_none());
+            assert!(app.model.recovery_ack.is_empty());
+            app.model.recovery_preview.as_ref().unwrap().clone()
+        }
+
+        fn restore(app: &mut Preview, preview: &RecoveryPreview) -> Command<Message> {
+            no_command(app.dispatch(Message::RecoveryAckChanged(
+                preview.clone(),
+                "RESTORE".into(),
+            )));
+            assert!(app.model.can_restore_recovery(preview));
+            let command = app.dispatch(Message::RestoreRecovery(preview.clone()));
+            let request = app.model.pending_recovery.as_ref().unwrap();
+            owns(app, request);
+            assert!(matches!(&request.action, RecoveryAction::Restore(_)));
+            assert!(app.model.restoring());
+            assert!(app.model.inventory.is_none());
+            assert!(app.model.recovery_preview.is_none());
+            assert!(app.model.recovery_ack.is_empty());
+            assert!(app.model.scan.is_none());
+            assert!(!app.model.scan_requested);
+            command
+        }
+
+        #[test]
+        fn inspect_preflight_core_cancel_and_preview_cancel_preserve_complete_trees() {
+            let (wow, data, mut app, addons) = fixture(true);
+            let before = tree(wow.path());
+            let config_before = tree(data.path());
+
+            // Construction, rendering and the native-check message do not recover.
+            assert!(app.model.recovery_job.is_none());
+            assert!(app.subscription().recipes().is_empty());
+            drop(app.view());
+            no_command(app.dispatch(Message::NativeCheckDone));
+            assert!(app.model.recovery_job.is_none());
+            assert_no_release_work(&app.model);
+
+            let preview = plan(&mut app);
+            assert_eq!(preview.request.root, app.model.root);
+            assert_eq!(preview.request.product, Product::Retail);
+            assert_eq!(preview.request.addons.canonicalize().unwrap(), addons);
+            assert_eq!(preview.approval.root(), addons.as_path());
+            assert_ne!(preview.approval.root(), app.model.root.as_path());
+            assert_eq!(preview.approval.originals(), ["Bar", "Foo"]);
+            assert_eq!(
+                preview.approval.move_aside_if_present(),
+                ["Bar", "Foo", "New"]
+            );
+            // Bar is approved as affected, not falsely asserted to exist.
+            assert!(!addons.join("Bar").exists());
+            assert_eq!(tree(wow.path()), before);
+            assert_eq!(tree(data.path()), config_before);
+
+            // Exercise actual checked-core cancellation. The GUI's restore
+            // worker always supplies admitted consent; it has no cancel dialog.
+            let mut calls = 0;
+            let outcome = restore_originals_checked(
+                &addons,
+                preview.approval.as_ref(),
+                |originals, retained| {
+                    calls += 1;
+                    assert_eq!(originals, preview.approval.originals());
+                    assert_eq!(retained, preview.approval.move_aside_if_present());
+                    false
+                },
+            )
+            .unwrap();
+            assert_eq!(calls, 1);
+            assert_eq!(outcome, Outcome::Cancelled);
+            assert_eq!(tree(wow.path()), before);
+            assert_eq!(tree(data.path()), config_before);
+
+            no_command(app.dispatch(Message::RecoveryAckChanged(
+                preview.clone(),
+                "RESTORE".into(),
+            )));
+            no_command(app.dispatch(Message::CancelRecoveryPreview(preview.clone())));
+            assert!(app.model.recovery_preview.is_none());
+            assert!(app.model.recovery_ack.is_empty());
+            assert_eq!(
+                app.model.recovery_error.as_deref(),
+                Some("Preview cancelled. No addon folders were changed.")
+            );
+            no_command(app.dispatch(Message::RestoreRecovery(preview)));
+            assert!(app.model.recovery_outcome.is_none());
+            assert!(app.model.recovery_job.is_none());
+            assert!(app.model.receipt_worker.is_none());
+            assert!(!addons.join(".patchloom-restore").exists());
+            drop(app.view());
+            assert_no_release_work(&app.model);
+            assert_eq!(tree(wow.path()), before);
+            assert_eq!(tree(data.path()), config_before);
+        }
+
+        #[test]
+        fn no_journal_is_reported_without_creating_a_mutex_or_offering_a_plan() {
+            let (wow, data, mut app, addons) = fixture(false);
+            let before = tree(wow.path());
+            let config_before = tree(data.path());
+
+            let command = app.dispatch(Message::InspectRecovery);
+            finish(&mut app, command);
+            let inspection = app.model.recovery_inspection.as_ref().unwrap();
+            assert_eq!(inspection.root, addons);
+            assert_eq!(inspection.phase, "none");
+            assert!(app.model.recovery_error.is_none());
+            assert!(!app.model.can_preview_recovery());
+            no_command(app.dispatch(Message::PreviewRecovery));
+            assert!(app.model.recovery_preview.is_none());
+
+            assert!(preflight_restore_originals(&addons).is_err());
+            assert!(!addons.join(".patchloom-install.lock").exists());
+            assert!(!addons.join(".patchloom-install").exists());
+            assert!(!addons.join(".patchloom-restore").exists());
+            drop(app.view());
+            assert_no_release_work(&app.model);
+            assert_eq!(tree(wow.path()), before);
+            assert_eq!(tree(data.path()), config_before);
+        }
+
+        #[test]
+        fn checked_restore_command_restores_bundle_and_retains_versions_and_journals() {
+            let (wow, data, mut app, addons) = fixture(true);
+            let untouched = [
+                wow.path().join("_classic_"),
+                wow.path().join("_retail_/WTF"),
+                addons.join("WTF"),
+                addons.join("SavedVariables"),
+                addons.join("Unrelated"),
+            ];
+            let before: Vec<_> = untouched.iter().map(|path| tree(path)).collect();
+            let config_before = tree(data.path());
+            let build_before = fs::read(wow.path().join(".build.info")).unwrap();
+            let transaction = addons.join(".patchloom-install");
+            let journal_before = fs::read(transaction.join("plan.yml")).unwrap();
+            let mutex_before = fs::read(addons.join(".patchloom-install.lock")).unwrap();
+
+            let preview = plan(&mut app);
+            let command = restore(&mut app, &preview);
+            let request = app.model.pending_recovery.as_ref().unwrap().clone();
+
+            // Admission consumes consent and reserves capacity before polling.
+            no_command(app.dispatch(Message::RestoreRecovery(preview.clone())));
+            owns(&app, &request);
+            assert!(addons.join("Foo/new.lua").is_file());
+            assert!(!addons.join(".patchloom-restore").exists());
+
+            // Actual Command -> spawn_blocking -> checked core -> post-inspection.
+            let message = local_message(command);
+            assert!(matches!(
+                &message,
+                Message::RecoveryDone(
+                    _,
+                    RecoveryResult::Restore {
+                        outcome: Ok(Outcome::RestoredRetained),
+                        inspection: Ok(_),
+                    }
+                )
+            ));
+            // Completed worker output has not yet released UI capacity.
+            owns(&app, &request);
+            assert!(app.model.restoring());
+            no_command(app.dispatch(message.clone()));
+
+            assert!(!app.model.restoring());
+            assert!(app.model.recovery_job.is_none());
+            assert!(app.model.pending_recovery.is_none());
+            assert!(app.model.receipt_worker.is_none());
+            assert!(app.model.inventory.is_none());
+            assert!(app.model.receipt.is_none());
+            assert!(app.model.recovery_post_error.is_none());
+            assert!(matches!(
+                app.model.recovery_outcome.as_ref(),
+                Some(Ok(Outcome::RestoredRetained))
+            ));
+            assert_eq!(fs::read(addons.join("Foo/old.lua")).unwrap(), b"original");
+            assert_eq!(
+                fs::read(addons.join("Bar/old.lua")).unwrap(),
+                b"original-bar"
+            );
+            assert!(!addons.join("Foo/new.lua").exists());
+            assert!(!addons.join("New").exists());
+            assert_eq!(
+                fs::read(addons.join(".patchloom-restore/backup/Foo/new.lua")).unwrap(),
+                b"replacement"
+            );
+            assert_eq!(
+                fs::read(addons.join(".patchloom-restore/backup/New/new.lua")).unwrap(),
+                b"additional"
+            );
+            assert_eq!(
+                fs::read(transaction.join("plan.yml")).unwrap(),
+                journal_before
+            );
+            assert!(transaction.join("ready").is_file());
+            assert!(transaction.join("backup").is_dir());
+            assert!(transaction.join("staged").is_dir());
+            assert!(addons.join(".patchloom-restore/plan.yml").is_file());
+            assert!(addons.join(".patchloom-restore/committed").is_file());
+            let inspection = app.model.recovery_inspection.as_ref().unwrap();
+            assert_eq!(
+                inspection.restore_phase.as_deref(),
+                Some("restoring-or-restored")
+            );
+            assert_eq!(inspection.retained_replacements, ["Foo", "New"]);
+
+            // Retained recovery state is not cleaned up or made reusable.
+            assert!(preflight_restore_originals(&addons).is_err());
+            no_command(app.dispatch(message));
+            no_command(app.dispatch(Message::RestoreRecovery(preview)));
+            no_command(app.dispatch(Message::NativeCheckDone));
+            drop(app.view());
+            assert!(app.model.recovery_job.is_none());
+            assert!(app.model.scan.is_none());
+            assert!(!app.model.scan_requested);
+            assert_no_release_work(&app.model);
+            assert!(addons.join(".patchloom-restore/committed").is_file());
+            for (path, expected) in untouched.iter().zip(&before) {
+                assert_eq!(&tree(path), expected);
+            }
+            assert_eq!(tree(data.path()), config_before);
+            assert_eq!(
+                fs::read(wow.path().join(".build.info")).unwrap(),
+                build_before
+            );
+            assert_eq!(
+                fs::read(addons.join(".patchloom-install.lock")).unwrap(),
+                mutex_before
+            );
+        }
+
+        #[test]
+        fn journal_backup_and_current_changes_are_refused_by_the_real_worker() {
+            for change in 0..3 {
+                let (wow, data, mut app, addons) = fixture(true);
+                let preview = plan(&mut app);
+                let path = match change {
+                    0 => addons.join(".patchloom-install/plan.yml"),
+                    1 => addons.join(".patchloom-install/backup/Foo/old.lua"),
+                    _ => addons.join("Foo/new.lua"),
+                };
+                let mut bytes = fs::read(&path).unwrap();
+                if change == 0 {
+                    // Same valid parsed plan, different authority bytes.
+                    bytes.extend_from_slice(b"\n# changed after preview\n");
+                } else {
+                    bytes[0] ^= 1;
+                }
+                fs::write(path, bytes).unwrap();
+                let before = tree(wow.path());
+                let config_before = tree(data.path());
+
+                let command = restore(&mut app, &preview);
+                let message = local_message(command);
+                assert!(matches!(
+                    &message,
+                    Message::RecoveryDone(
+                        _,
+                        RecoveryResult::Restore {
+                            outcome: Ok(Outcome::Changed),
+                            inspection: Ok(_),
+                        }
+                    )
+                ));
+                no_command(app.dispatch(message));
+                assert!(matches!(
+                    app.model.recovery_outcome.as_ref(),
+                    Some(Ok(Outcome::Changed))
+                ));
+                assert!(app.model.recovery_preview.is_none());
+                assert!(app.model.recovery_ack.is_empty());
+                assert!(app.model.recovery_post_error.is_none());
+                assert!(app.model.inventory.is_none());
+                no_command(app.dispatch(Message::RecoveryAckChanged(
+                    preview.clone(),
+                    "RESTORE".into(),
+                )));
+                no_command(app.dispatch(Message::RestoreRecovery(preview)));
+                drop(app.view());
+                assert!(!addons.join(".patchloom-restore").exists());
+                assert!(app.model.recovery_job.is_none());
+                assert_no_release_work(&app.model);
+                assert_eq!(tree(wow.path()), before);
+                assert_eq!(tree(data.path()), config_before);
+            }
+        }
+
+        #[test]
+        fn consent_rejects_prefixes_and_foreign_scope_generation_token_and_ticket() {
+            let (wow, data, mut app, addons) = fixture(true);
+            let (_other_wow, _other_data, _other_app, other_addons) = fixture(true);
+            let preview = plan(&mut app);
+            let before = tree(wow.path());
+            let config_before = tree(data.path());
+
+            no_command(app.dispatch(Message::RestoreRecovery(preview.clone())));
+            for answer in [
+                "",
+                "restore",
+                " RESTORE",
+                "RESTORE ",
+                "RESTORE\n",
+                "RESTOREx",
+                "RESTORE\u{202e}",
+            ] {
+                // An invalid replacement must also remove previously valid text.
+                no_command(app.dispatch(Message::RecoveryAckChanged(
+                    preview.clone(),
+                    "RESTORE".into(),
+                )));
+                no_command(
+                    app.dispatch(Message::RecoveryAckChanged(preview.clone(), answer.into())),
+                );
+                assert!(!app.model.can_restore_recovery(&preview));
+                no_command(app.dispatch(Message::RestoreRecovery(preview.clone())));
+                assert!(app.model.recovery_job.is_none());
+            }
+
+            for mismatch in 0..7 {
+                let mut foreign = preview.clone();
+                match mismatch {
+                    0 => foreign.request.root = foreign.request.root.join("other"),
+                    1 => foreign.request.addons = foreign.request.addons.join("other"),
+                    2 => foreign.request.product = Product::ClassicProgression,
+                    3 => foreign.request.generation = Arc::new(()),
+                    4 => foreign.request.token = Arc::new(()),
+                    5 => {
+                        // A real fresh ticket with identical content is still
+                        // a different in-memory approval identity.
+                        foreign.approval = Arc::new(preflight_restore_originals(&addons).unwrap());
+                    }
+                    _ => {
+                        foreign.approval =
+                            Arc::new(preflight_restore_originals(&other_addons).unwrap());
+                    }
+                }
+
+                no_command(app.dispatch(Message::RecoveryAckChanged(
+                    preview.clone(),
+                    "RESTORE".into(),
+                )));
+                no_command(
+                    app.dispatch(Message::RecoveryAckChanged(foreign.clone(), String::new())),
+                );
+                assert_eq!(app.model.recovery_ack, "RESTORE");
+                no_command(app.dispatch(Message::RestoreRecovery(foreign.clone())));
+                no_command(app.dispatch(Message::CancelRecoveryPreview(foreign)));
+                assert!(app.model.current_recovery_preview(&preview));
+                assert!(app.model.recovery_job.is_none());
+                assert!(app.model.receipt_worker.is_none());
+                assert!(app.model.recovery_outcome.is_none());
+            }
+
+            assert!(!addons.join(".patchloom-restore").exists());
+            assert_no_release_work(&app.model);
+            assert_eq!(tree(wow.path()), before);
+            assert_eq!(tree(data.path()), config_before);
+        }
+        // Added 2026-10-28; original GPLv3 applies.
+        fn finish_recovery_failure(app: &mut Preview, command: Command<Message>) {
+            let message = local_message(command);
+            let expected = match &message {
+                Message::RecoveryDone(
+                    request,
+                    RecoveryResult::Inspection(Err(error)) | RecoveryResult::Preview(Err(error)),
+                ) => {
+                    owns(app, request);
+                    assert!(!error.is_empty());
+                    error.clone()
+                }
+                other => panic!("Expected actual recovery failure: {:?}", other),
+            };
+            no_command(app.dispatch(message));
+            assert_eq!(app.model.recovery_error.as_deref(), Some(expected.as_str()));
+            assert!(app.model.recovery_preview.is_none());
+            assert!(app.model.recovery_ack.is_empty());
+            assert!(app.model.recovery_outcome.is_none());
+            assert!(app.model.recovery_post_error.is_none());
+            assert!(app.model.pending_recovery.is_none());
+            assert!(app.model.recovery_job.is_none());
+            assert!(app.model.receipt_worker.is_none());
+        }
+
+        #[test]
+        fn product_rescan_draft_and_open_aba_require_a_new_preview_and_ack() {
+            for change in 0..4 {
+                let (wow, data, mut app, addons) = fixture(true);
+                let (other, _) = receipt_model();
+                let before = tree(wow.path());
+                let config_before = tree(data.path());
+                let other_before = tree(other.path());
+                let old = plan(&mut app);
+                no_command(
+                    app.dispatch(Message::RecoveryAckChanged(old.clone(), "RESTORE".into())),
+                );
+                let original = app.model.root.clone();
+                let generation = app.model.generation.clone();
+
+                match change {
+                    0 => {
+                        no_command(app.dispatch(Message::Select(Product::ClassicProgression)));
+                        no_command(app.dispatch(Message::Select(Product::Retail)));
+                        // Selection ABA must fail even without a new generation.
+                        assert!(Arc::ptr_eq(&generation, &app.model.generation));
+                    }
+                    1 => {
+                        let command = app.dispatch(Message::Rescan);
+                        finish(&mut app, command);
+                        no_command(app.dispatch(Message::Select(Product::Retail)));
+                    }
+                    2 => {
+                        let away = original.join("unopened-draft");
+                        no_command(app.dispatch(Message::RootInputChanged(
+                            away.to_str().expect("UTF-8 fixture path").into(),
+                        )));
+                        no_command(app.dispatch(Message::RootInputChanged(
+                            original.to_str().expect("UTF-8 fixture path").into(),
+                        )));
+                        assert!(app.root_edited);
+                        no_command(app.dispatch(Message::RestoreRecovery(old.clone())));
+                        let command = app.dispatch(Message::OpenRoot);
+                        finish(&mut app, command);
+                        no_command(app.dispatch(Message::Select(Product::Retail)));
+                    }
+                    _ => {
+                        for root in [other.path(), original.as_path()] {
+                            no_command(app.dispatch(Message::RootInputChanged(
+                                root.to_str().expect("UTF-8 fixture path").into(),
+                            )));
+                            let command = app.dispatch(Message::OpenRoot);
+                            finish(&mut app, command);
+                        }
+                        no_command(app.dispatch(Message::Select(Product::Retail)));
+                    }
+                }
+
+                assert_eq!(app.model.root, original);
+                assert_eq!(app.model.selected, Some(Product::Retail));
+                if change != 0 {
+                    assert!(!Arc::ptr_eq(&generation, &app.model.generation));
+                }
+                assert!(!app.root_edited);
+                assert!(app.model.recovery_preview.is_none());
+                assert!(app.model.recovery_ack.is_empty());
+                assert!(!app.model.current_recovery_preview(&old));
+                no_command(
+                    app.dispatch(Message::RecoveryAckChanged(old.clone(), "RESTORE".into())),
+                );
+                no_command(app.dispatch(Message::RestoreRecovery(old.clone())));
+                assert!(app.model.recovery_job.is_none());
+
+                let fresh = plan(&mut app);
+                assert_eq!(fresh.approval.root(), addons.as_path());
+                assert!(!Arc::ptr_eq(&old.request.token, &fresh.request.token));
+                assert!(!Arc::ptr_eq(&old.approval, &fresh.approval));
+                assert!(app.model.recovery_ack.is_empty());
+                no_command(app.dispatch(Message::RestoreRecovery(fresh.clone())));
+
+                // Stale events cannot consume, clear or reuse fresh consent.
+                no_command(
+                    app.dispatch(Message::RecoveryAckChanged(fresh.clone(), "RESTORE".into())),
+                );
+                no_command(app.dispatch(Message::RecoveryAckChanged(old.clone(), String::new())));
+                no_command(app.dispatch(Message::CancelRecoveryPreview(old.clone())));
+                no_command(app.dispatch(Message::RestoreRecovery(old)));
+                assert_eq!(app.model.recovery_ack, "RESTORE");
+                assert!(app.model.current_recovery_preview(&fresh));
+                assert!(app.model.can_restore_recovery(&fresh));
+                assert!(app.model.recovery_job.is_none());
+                assert!(app.model.receipt_worker.is_none());
+                assert!(!addons.join(".patchloom-restore").exists());
+                assert_no_release_work(&app.model);
+                assert_eq!(tree(wow.path()), before);
+                assert_eq!(tree(data.path()), config_before);
+                assert_eq!(tree(other.path()), other_before);
+            }
+        }
+
+        #[test]
+        fn invalid_unknown_and_missing_original_states_fail_without_fixture_changes() {
+            for change in 0..8 {
+                let (wow, data, mut app, addons) = fixture(true);
+                let command = app.dispatch(Message::InspectRecovery);
+                finish(&mut app, command);
+                assert!(app.model.can_preview_recovery());
+                let transaction = addons.join(".patchloom-install");
+
+                match change {
+                    0 => fs::write(transaction.join("plan.yml"), b"version: [invalid").unwrap(),
+                    1 => fs::write(
+                        transaction.join("plan.yml"),
+                        b"version: 99\nprevious: [Bar, Foo]\nincoming: [Foo, New]\n",
+                    )
+                    .unwrap(),
+                    2 => fs::write(transaction.join("unknown-entry"), b"retain me").unwrap(),
+                    3 => {
+                        fs::create_dir(transaction.join("backup/Unexpected")).unwrap();
+                        fs::write(
+                            transaction.join("backup/Unexpected/keep.lua"),
+                            b"unknown backup",
+                        )
+                        .unwrap();
+                    }
+                    4 => fs::write(transaction.join("ready"), b"invalid marker").unwrap(),
+                    5 => fs::write(transaction.join("committed"), b"").unwrap(),
+                    6 => fs::rename(
+                        transaction.join("backup/Foo"),
+                        wow.path().join("preserved-original"),
+                    )
+                    .unwrap(),
+                    _ => {
+                        fs::remove_file(addons.join(".patchloom-install.lock")).unwrap();
+                        fs::create_dir(addons.join(".patchloom-install.lock")).unwrap();
+                    }
+                }
+                let before = tree(wow.path());
+                let config_before = tree(data.path());
+
+                // A formerly readable inspection is not authority. Actual
+                // preflight must reject the changed invalid state.
+                let command = app.dispatch(Message::PreviewRecovery);
+                finish_recovery_failure(&mut app, command);
+
+                let command = app.dispatch(Message::InspectRecovery);
+                if change == 6 {
+                    // Inspection reports missing backups; it does not certify
+                    // that the original bundle can be restored.
+                    finish(&mut app, command);
+                    let inspection = app.model.recovery_inspection.as_ref().unwrap();
+                    assert_eq!(inspection.phase, "ready-marker");
+                    assert_eq!(inspection.backups, ["Bar"]);
+                    assert!(app.model.recovery_error.is_none());
+                    let command = app.dispatch(Message::PreviewRecovery);
+                    finish_recovery_failure(&mut app, command);
+                } else {
+                    finish_recovery_failure(&mut app, command);
+                    assert!(app.model.recovery_inspection.is_none());
+                }
+
+                drop(app.view());
+                no_command(app.dispatch(Message::NativeCheckDone));
+                assert!(app.model.recovery_job.is_none());
+                assert!(app.model.recovery_preview.is_none());
+                assert!(app.model.scan.is_none());
+                assert!(!addons.join(".patchloom-restore").exists());
+                assert_no_release_work(&app.model);
+                assert_eq!(tree(wow.path()), before);
+                assert_eq!(tree(data.path()), config_before);
+            }
+        }
+
+        #[test]
+        fn busy_mutex_rejects_inspect_preflight_and_checked_restore_without_retry() {
+            for action in 0..3 {
+                let (wow, data, mut app, addons) = fixture(true);
+                let preview = if action == 2 {
+                    Some(plan(&mut app))
+                } else {
+                    if action == 1 {
+                        let command = app.dispatch(Message::InspectRecovery);
+                        finish(&mut app, command);
+                    }
+                    None
+                };
+                let before = tree(wow.path());
+                let config_before = tree(data.path());
+                let lock = fs::File::options()
+                    .read(true)
+                    .write(true)
+                    .open(addons.join(".patchloom-install.lock"))
+                    .unwrap();
+                lock.try_lock().unwrap();
+
+                let command = match action {
+                    0 => app.dispatch(Message::InspectRecovery),
+                    1 => app.dispatch(Message::PreviewRecovery),
+                    _ => restore(&mut app, preview.as_ref().unwrap()),
+                };
+                let request = app.model.pending_recovery.as_ref().unwrap().clone();
+                owns(&app, &request);
+
+                if action == 2 {
+                    let message = local_message(command);
+                    assert!(matches!(
+                        &message,
+                        Message::RecoveryDone(
+                            _,
+                            RecoveryResult::Restore {
+                                outcome: Err(_),
+                                inspection: Err(_),
+                            }
+                        )
+                    ));
+                    // Error and follow-up error have both been obtained, but
+                    // capacity remains reserved until matching dispatch.
+                    owns(&app, &request);
+                    assert!(app.model.restoring());
+                    no_command(app.dispatch(message.clone()));
+                    no_command(app.dispatch(message));
+                    assert!(matches!(app.model.recovery_outcome.as_ref(), Some(Err(_))));
+                    assert!(app.model.recovery_post_error.is_some());
+                    assert!(app.model.recovery_inspection.is_none());
+                    assert!(app.model.inventory.is_none());
+                } else {
+                    finish_recovery_failure(&mut app, command);
+                }
+
+                // Never inventory or reopen mutex bytes while this handle
+                // holds the exclusive OS lock, including on Windows.
+                drop(lock);
+                assert!(app.model.recovery_job.is_none());
+                assert!(app.model.pending_recovery.is_none());
+                assert!(app.model.receipt_worker.is_none());
+                drop(app.view());
+                no_command(app.dispatch(Message::NativeCheckDone));
+                assert!(app.model.recovery_job.is_none());
+                assert_no_release_work(&app.model);
+                assert!(!addons.join(".patchloom-restore").exists());
+                assert_eq!(tree(wow.path()), before);
+                assert_eq!(tree(data.path()), config_before);
+
+                // Lock release permits a fresh real preflight. It does not
+                // trigger an implicit GUI retry or reuse the consumed consent.
+                let fresh = preflight_restore_originals(&addons).unwrap();
+                assert_eq!(fresh.root(), addons.as_path());
+                assert!(app.model.recovery_preview.is_none());
+                assert!(app.model.recovery_ack.is_empty());
+                assert_eq!(tree(wow.path()), before);
+                assert_eq!(tree(data.path()), config_before);
+            }
+        }
+
+        #[cfg(any(unix, windows))]
+        fn fixture_directory_link(alias: &Path, target: &Path) {
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(target, alias).unwrap();
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                let output = std::process::Command::new("cmd.exe")
+                    .args(["/d", "/c", "mklink", "/J"])
+                    .arg(alias.components().collect::<PathBuf>())
+                    .arg(target.components().collect::<PathBuf>())
+                    .creation_flags(0x08000000)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                use std::os::windows::fs::MetadataExt;
+                assert_ne!(
+                    fs::symlink_metadata(alias).unwrap().file_attributes() & 0x400,
+                    0
+                );
+            }
+        }
+
+        #[cfg(any(unix, windows))]
+        #[test]
+        fn linked_root_journal_backup_and_current_content_cannot_get_approval() {
+            for location in 0..4 {
+                let (wow, data, mut app, addons) = fixture(true);
+                let command = app.dispatch(Message::InspectRecovery);
+                finish(&mut app, command);
+                let transaction = addons.join(".patchloom-install");
+                let outside = data.path().join("link-target");
+                fs::create_dir(&outside).unwrap();
+                fs::write(outside.join("keep.lua"), b"outside sentinel").unwrap();
+                let (alias, target) = match location {
+                    0 => {
+                        let saved = wow.path().join("preserved-addons");
+                        fs::rename(&addons, &saved).unwrap();
+                        (addons.clone(), saved)
+                    }
+                    1 => {
+                        let saved = wow.path().join("preserved-journal");
+                        fs::rename(&transaction, &saved).unwrap();
+                        (transaction.clone(), saved)
+                    }
+                    2 => (transaction.join("backup/Foo/link"), outside.clone()),
+                    _ => (addons.join("Foo/link"), outside.clone()),
+                };
+                fixture_directory_link(&alias, &target);
+                let before = tree(wow.path());
+                let config_before = tree(data.path());
+                let target_before = tree(&target);
+
+                let command = app.dispatch(Message::PreviewRecovery);
+                finish_recovery_failure(&mut app, command);
+                let command = app.dispatch(Message::InspectRecovery);
+                if location == 3 {
+                    // Inspection lists destinations without recursively
+                    // approving current content. Preflight above rejected it.
+                    finish(&mut app, command);
+                    assert!(app.model.recovery_error.is_none());
+                    assert!(app.model.recovery_inspection.is_some());
+                    assert!(app.model.recovery_preview.is_none());
+                } else {
+                    finish_recovery_failure(&mut app, command);
+                }
+                assert!(app.model.recovery_outcome.is_none());
+                assert!(app.model.recovery_job.is_none());
+                assert_no_release_work(&app.model);
+                assert_eq!(tree(wow.path()), before);
+                assert_eq!(tree(data.path()), config_before);
+                assert_eq!(tree(&target), target_before);
+
+                #[cfg(windows)]
+                fs::remove_dir(&alias).unwrap(); // Unlink only this fixture junction.
+                assert_eq!(tree(&target), target_before);
+                assert_eq!(
+                    fs::read(outside.join("keep.lua")).unwrap(),
+                    b"outside sentinel"
+                );
+            }
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn linked_mutex_plan_and_marker_fail_actual_dispatch_without_touching_targets() {
+            for location in 0..3 {
+                let (wow, data, mut app, addons) = fixture(true);
+                let command = app.dispatch(Message::InspectRecovery);
+                finish(&mut app, command);
+                let path = match location {
+                    0 => addons.join(".patchloom-install.lock"),
+                    1 => addons.join(".patchloom-install/plan.yml"),
+                    _ => addons.join(".patchloom-install/ready"),
+                };
+                let saved = wow.path().join("preserved-linked-file");
+                fs::rename(&path, &saved).unwrap();
+                std::os::unix::fs::symlink(&saved, &path).unwrap();
+                let before = tree(wow.path());
+                let config_before = tree(data.path());
+
+                let command = app.dispatch(Message::PreviewRecovery);
+                finish_recovery_failure(&mut app, command);
+                let command = app.dispatch(Message::InspectRecovery);
+                finish_recovery_failure(&mut app, command);
+                assert!(!addons.join(".patchloom-restore").exists());
+                assert_no_release_work(&app.model);
+                assert_eq!(tree(wow.path()), before);
+                assert_eq!(tree(data.path()), config_before);
+            }
+        }
+
+        // Added 2026-10-28; original GPLv3 applies.
+        #[test]
+        fn scan_and_receipt_capacity_exclude_recovery_and_drain_one_queued_scan() {
+            for receipt_owner in [false, true] {
+                let (wow, data, mut app, _) = fixture(true);
+                let preview = plan(&mut app);
+                no_command(app.dispatch(Message::RecoveryAckChanged(
+                    preview.clone(),
+                    "RESTORE".into(),
+                )));
+                no_command(app.dispatch(Message::ReceiptIdChanged("a".repeat(64))));
+                let before = tree(wow.path());
+                let config_before = tree(data.path());
+                let command = app.dispatch(if receipt_owner {
+                    Message::InspectReceipt
+                } else {
+                    Message::Rescan
+                });
+                let token = if receipt_owner {
+                    app.model.receipt_worker.as_ref().unwrap().clone()
+                } else {
+                    app.model.scan.as_ref().unwrap().clone()
+                };
+
+                for message in [
+                    Message::InspectRecovery,
+                    Message::PreviewRecovery,
+                    Message::RestoreRecovery(preview.clone()),
+                    Message::InspectReceipt,
+                ] {
+                    no_command(app.dispatch(message));
+                }
+                assert!(app.model.recovery_job.is_none());
+                assert!(app.model.pending_recovery.is_none());
+                no_command(app.dispatch(Message::Rescan));
+                no_command(app.dispatch(Message::Rescan));
+                assert!(app.model.scan_requested);
+                let owner = if receipt_owner {
+                    app.model.receipt_worker.as_ref().unwrap()
+                } else {
+                    app.model.scan.as_ref().unwrap()
+                };
+                assert!(Arc::ptr_eq(owner, &token));
+
+                let old = local_message(command);
+                let queued = app.dispatch(old.clone());
+                assert!(app.model.receipt_worker.is_none());
+                assert!(!app.model.scan_requested);
+                let scan = app.model.scan.as_ref().unwrap().clone();
+                no_command(app.dispatch(old));
+                assert!(Arc::ptr_eq(app.model.scan.as_ref().unwrap(), &scan));
+                no_command(app.dispatch(Message::InspectRecovery));
+                no_command(app.dispatch(Message::PreviewRecovery));
+                no_command(app.dispatch(Message::InspectReceipt));
+                finish(&mut app, queued);
+                no_command(app.dispatch(Message::Select(Product::Retail)));
+                assert!(app.model.recovery_slot_available());
+                assert!(app.model.recovery_inspection.is_none());
+                assert!(app.model.recovery_preview.is_none());
+                assert!(app.model.receipt.is_none());
+                assert!(app.model.receipt_error.is_none());
+                assert_no_release_work(&app.model);
+                assert_eq!(tree(wow.path()), before);
+                assert_eq!(tree(data.path()), config_before);
+            }
+        }
+
+        #[test]
+        fn invalidation_keeps_recovery_capacity_until_stale_matching_completion() {
+            for preview_action in [false, true] {
+                for change in 0..4 {
+                    let (wow, data, mut app, _) = fixture(true);
+                    let (other, _) = receipt_model();
+                    let approved = plan(&mut app);
+                    let before = tree(wow.path());
+                    let config_before = tree(data.path());
+                    let other_before = tree(other.path());
+                    let command = app.dispatch(if preview_action {
+                        Message::PreviewRecovery
+                    } else {
+                        Message::InspectRecovery
+                    });
+                    let request = app.model.pending_recovery.as_ref().unwrap().clone();
+                    let message = local_message(command);
+                    let root = app.model.root.clone();
+
+                    match change {
+                        0 => {
+                            no_command(app.dispatch(Message::Select(Product::ClassicProgression)));
+                            no_command(app.dispatch(Message::Select(Product::Retail)));
+                        }
+                        1 => no_command(app.dispatch(Message::Rescan)),
+                        2 => {
+                            no_command(app.dispatch(Message::Rescan));
+                            for path in [root.join("draft-only"), root.clone()] {
+                                no_command(app.dispatch(Message::RootInputChanged(
+                                    path.to_str().unwrap().into(),
+                                )));
+                            }
+                            assert!(!app.model.scan_requested);
+                            assert!(app.root_edited);
+                        }
+                        _ => {
+                            for path in [other.path(), root.as_path()] {
+                                no_command(app.dispatch(Message::RootInputChanged(
+                                    path.to_str().unwrap().into(),
+                                )));
+                                no_command(app.dispatch(Message::OpenRoot));
+                            }
+                        }
+                    }
+                    assert!(app.model.pending_recovery.is_none());
+                    assert!(app
+                        .model
+                        .recovery_job
+                        .as_ref()
+                        .unwrap()
+                        .same_request(&request));
+                    assert!(Arc::ptr_eq(
+                        app.model.receipt_worker.as_ref().unwrap(),
+                        &request.token,
+                    ));
+                    assert!(app.model.scan.is_none());
+                    for rejected in [
+                        Message::InspectRecovery,
+                        Message::PreviewRecovery,
+                        Message::InspectReceipt,
+                        Message::RestoreRecovery(approved),
+                        Message::NativeCheckDone,
+                    ] {
+                        no_command(app.dispatch(rejected));
+                    }
+                    assert!(!app.should_exit());
+
+                    let queued = app.model.scan_requested;
+                    let next = app.dispatch(message.clone());
+                    assert!(app.model.recovery_job.is_none());
+                    assert!(app.model.receipt_worker.is_none());
+                    assert!(app.model.recovery_inspection.is_none());
+                    assert!(app.model.recovery_preview.is_none());
+                    assert!(app.model.recovery_error.is_none());
+                    assert!(app.model.recovery_outcome.is_none());
+                    assert!(app.model.recovery_ack.is_empty());
+                    if queued {
+                        let token = app.model.scan.as_ref().unwrap().clone();
+                        no_command(app.dispatch(message));
+                        assert!(Arc::ptr_eq(app.model.scan.as_ref().unwrap(), &token,));
+                        finish(&mut app, next);
+                    } else {
+                        no_command(next);
+                        no_command(app.dispatch(message));
+                        assert!(app.model.scan.is_none());
+                    }
+                    if app.root_edited {
+                        let command = app.dispatch(Message::OpenRoot);
+                        finish(&mut app, command);
+                    }
+                    no_command(app.dispatch(Message::Select(Product::Retail)));
+                    assert!(app.model.recovery_slot_available());
+                    assert!(app.model.recovery_inspection.is_none());
+                    assert!(app.model.recovery_preview.is_none());
+                    assert_no_release_work(&app.model);
+                    assert_eq!(tree(wow.path()), before);
+                    assert_eq!(tree(data.path()), config_before);
+                    assert_eq!(tree(other.path()), other_before);
+                }
+            }
+        }
+
+        fn refuse_restore_scope_changes(app: &mut Preview, preview: &RecoveryPreview) {
+            let request = app.model.pending_recovery.as_ref().unwrap().clone();
+            let root = app.model.root.clone();
+            let input = app.root_input.clone();
+            let edited = app.root_edited;
+            let selected = app.model.selected;
+            let generation = app.model.generation.clone();
+            assert!(app.model.restoring());
+            for message in [
+                Message::RootInputChanged(root.join("refused-draft").to_str().unwrap().into()),
+                Message::OpenRoot,
+                Message::Select(Product::ClassicProgression),
+                Message::Rescan,
+                Message::CancelRecoveryPreview(preview.clone()),
+                Message::RecoveryAckChanged(preview.clone(), "RESTORE".into()),
+                Message::RestoreRecovery(preview.clone()),
+                Message::InspectRecovery,
+                Message::PreviewRecovery,
+                Message::InspectReceipt,
+                Message::CheckRelease,
+            ] {
+                no_command(app.dispatch(message));
+                owns(app, &request);
+                assert_eq!(app.model.root, root);
+                assert_eq!(app.root_input, input);
+                assert_eq!(app.root_edited, edited);
+                assert_eq!(app.model.selected, selected);
+                assert!(Arc::ptr_eq(&app.model.generation, &generation));
+                assert!(app.model.scan.is_none());
+                assert!(!app.model.scan_requested);
+                assert!(app.model.inventory.is_none());
+                assert!(app.model.receipt.is_none());
+                assert!(app.model.pending_receipt.is_none());
+                assert!(app.model.recovery_ack.is_empty());
+            }
+            drop(app.view());
+            no_command(app.dispatch(Message::NativeCheckDone));
+            assert!(!app.should_exit());
+            owns(app, &request);
+        }
+
+        #[test]
+        fn recovery_completions_require_full_identity_action_and_slot_ownership() {
+            for action in 0..3 {
+                let (wow, data, mut app, _) = fixture(true);
+                // Obtain genuine historical scan and receipt completions.
+                let command = app.dispatch(Message::Rescan);
+                let scan_message = local_message(command);
+                no_command(app.dispatch(scan_message.clone()));
+                no_command(app.dispatch(Message::Select(Product::Retail)));
+                no_command(app.dispatch(Message::ReceiptIdChanged("a".repeat(64))));
+                let command = app.dispatch(Message::InspectReceipt);
+                let receipt_message = local_message(command);
+                no_command(app.dispatch(receipt_message.clone()));
+                let preview = plan(&mut app);
+                let alternate =
+                    Arc::new(preflight_restore_originals(preview.approval.root()).unwrap());
+                assert!(!Arc::ptr_eq(&alternate, &preview.approval));
+
+                let command = match action {
+                    0 => app.dispatch(Message::InspectRecovery),
+                    1 => app.dispatch(Message::PreviewRecovery),
+                    _ => restore(&mut app, &preview),
+                };
+                let request = app.model.pending_recovery.as_ref().unwrap().clone();
+                owns(&app, &request);
+                if action == 2 {
+                    refuse_restore_scope_changes(&mut app, &preview);
+                }
+                let message = local_message(command);
+                let result = match &message {
+                    Message::RecoveryDone(echo, result) => {
+                        assert!(echo.same_request(&request));
+                        result.clone()
+                    }
+                    other => panic!("Expected recovery completion: {:?}", other),
+                };
+                if action == 2 {
+                    assert!(matches!(
+                        &result,
+                        RecoveryResult::Restore {
+                            outcome: Ok(ajour_core::fs::RecoveryRestoreOutcome::RestoredRetained),
+                            inspection: Ok(_),
+                        }
+                    ));
+                    // Worker has returned both results; dispatch still owns
+                    // the reservation and continues refusing scope changes.
+                    refuse_restore_scope_changes(&mut app, &preview);
+                }
+                let after_worker = tree(wow.path());
+                let config_after_worker = tree(data.path());
+
+                for changed_field in 0..6 {
+                    let mut foreign = request.clone();
+                    match changed_field {
+                        0 => foreign.root = foreign.root.join("foreign"),
+                        1 => foreign.addons = foreign.addons.join("foreign"),
+                        2 => foreign.product = Product::ClassicProgression,
+                        3 => foreign.generation = Arc::new(()),
+                        4 => foreign.token = Arc::new(()),
+                        _ => {
+                            foreign.action = if action == 0 {
+                                RecoveryAction::Preview
+                            } else {
+                                RecoveryAction::Inspect
+                            }
+                        }
+                    }
+                    no_command(app.dispatch(Message::RecoveryDone(foreign, result.clone())));
+                    owns(&app, &request);
+                }
+                if action == 2 {
+                    let mut wrong_ticket = request.clone();
+                    wrong_ticket.action = RecoveryAction::Restore(alternate);
+                    no_command(app.dispatch(Message::RecoveryDone(wrong_ticket, result.clone())));
+                    owns(&app, &request);
+                }
+                // Deliberately malformed completion, not a claimed core result.
+                let wrong_kind = if action == 0 {
+                    RecoveryResult::Preview(Err("wrong result variant".into()))
+                } else {
+                    RecoveryResult::Inspection(Err("wrong result variant".into()))
+                };
+                no_command(app.dispatch(Message::RecoveryDone(request.clone(), wrong_kind)));
+                owns(&app, &request);
+
+                // A receipt/scan envelope cannot complete recovery merely by
+                // borrowing its token. Payloads came from actual local workers.
+                if let Message::ReceiptDone(mut receipt, result) = receipt_message.clone() {
+                    receipt.token = request.token.clone();
+                    no_command(app.dispatch(Message::ReceiptDone(receipt, result)));
+                } else {
+                    panic!("Expected receipt completion");
+                }
+                if let Message::InventoryDone(mut scan, result) = scan_message {
+                    scan.token = request.token.clone();
+                    no_command(app.dispatch(Message::InventoryDone(scan, result)));
+                } else {
+                    panic!("Expected inventory completion");
+                }
+                owns(&app, &request);
+                assert_eq!(tree(wow.path()), after_worker);
+                assert_eq!(tree(data.path()), config_after_worker);
+
+                no_command(app.dispatch(message.clone()));
+                assert!(app.model.recovery_job.is_none());
+                assert!(app.model.pending_recovery.is_none());
+                assert!(app.model.receipt_worker.is_none());
+
+                let command = app.dispatch(Message::Rescan);
+                let token = app.model.scan.as_ref().unwrap().clone();
+                no_command(app.dispatch(message.clone()));
+                assert!(Arc::ptr_eq(app.model.scan.as_ref().unwrap(), &token));
+                finish(&mut app, command);
+                no_command(app.dispatch(Message::Select(Product::Retail)));
+
+                let command = app.dispatch(Message::InspectRecovery);
+                let newer = app.model.pending_recovery.as_ref().unwrap().clone();
+                assert!(!Arc::ptr_eq(&newer.token, &request.token));
+                no_command(app.dispatch(message));
+                no_command(app.dispatch(receipt_message));
+                owns(&app, &newer);
+                let current = local_message(command);
+                no_command(app.dispatch(current.clone()));
+                let published = app.model.recovery_inspection.as_ref().unwrap().clone();
+                no_command(app.dispatch(current));
+                assert!(Arc::ptr_eq(
+                    app.model.recovery_inspection.as_ref().unwrap(),
+                    &published,
+                ));
+                assert!(app.model.recovery_slot_available());
+                assert_no_release_work(&app.model);
+                assert_eq!(tree(wow.path()), after_worker);
+                assert_eq!(tree(data.path()), config_after_worker);
+            }
+        }
+
+        #[test]
+        fn recovery_preserves_provider_capacity_and_typed_waits_without_http() {
+            for action in 0..3 {
+                for state in 0..4 {
+                    for rate_result in [false, true] {
+                        let (wow, data, mut app, _) = fixture(true);
+                        let preview = plan(&mut app);
+                        no_command(
+                            app.dispatch(Message::RepositoryChanged("fixture/addon".into())),
+                        );
+                        // Construct real provider commands; never poll them.
+                        let futures = app.dispatch(Message::CheckRelease).futures();
+                        assert_eq!(futures.len(), 1);
+                        let first = app.model.pending_release.as_ref().unwrap().clone();
+                        drop(futures);
+                        let active = if state == 0 {
+                            Some(first.clone())
+                        } else {
+                            let now = Instant::now();
+                            let wait = match state {
+                                1 => RetryDeadline::At(now),
+                                2 => RetryDeadline::from_wait(
+                                    now,
+                                    std::time::Duration::from_secs(172_800),
+                                ),
+                                _ => RetryDeadline::Blocked,
+                            };
+                            no_command(
+                                app.dispatch(Message::ReleaseRateLimited(first.clone(), wait)),
+                            );
+                            if state == 1 {
+                                let futures = app.dispatch(Message::CheckRelease).futures();
+                                assert_eq!(futures.len(), 1);
+                                let current = app.model.pending_release.as_ref().unwrap().clone();
+                                drop(futures);
+                                Some(current)
+                            } else {
+                                None
+                            }
+                        };
+                        let deadline = app.model.release_retry_at;
+                        let command = match action {
+                            0 => app.dispatch(Message::InspectRecovery),
+                            1 => app.dispatch(Message::PreviewRecovery),
+                            _ => restore(&mut app, &preview),
+                        };
+                        let recovery = app.model.pending_recovery.as_ref().unwrap().clone();
+                        owns(&app, &recovery);
+                        assert_eq!(app.model.release_retry_at, deadline);
+                        if let Some(provider) = &active {
+                            assert!(Arc::ptr_eq(
+                                app.model.release_worker.as_ref().unwrap(),
+                                &provider.token,
+                            ));
+                            assert_eq!(app.model.pending_release.is_some(), action != 2);
+                        } else {
+                            assert!(app.model.release_worker.is_none());
+                        }
+                        no_command(app.dispatch(Message::CheckRelease));
+                        let message = local_message(command);
+                        owns(&app, &recovery);
+                        no_command(app.dispatch(message));
+                        assert_eq!(app.model.release_retry_at, deadline);
+                        let after = tree(wow.path());
+                        let config_after = tree(data.path());
+
+                        let mut foreign = active.as_ref().unwrap_or(&first).clone();
+                        foreign.token = Arc::new(());
+                        no_command(app.dispatch(Message::ReleaseRateLimited(
+                            foreign,
+                            RetryDeadline::Blocked,
+                        )));
+                        assert_eq!(app.model.release_retry_at, deadline);
+
+                        let expected = if let Some(provider) = active {
+                            assert!(Arc::ptr_eq(
+                                app.model.release_worker.as_ref().unwrap(),
+                                &provider.token,
+                            ));
+                            let expected = if rate_result {
+                                let incoming = if state == 0 {
+                                    RetryDeadline::from_wait(
+                                        Instant::now(),
+                                        std::time::Duration::from_secs(172_800),
+                                    )
+                                } else {
+                                    RetryDeadline::Blocked
+                                };
+                                no_command(app.dispatch(Message::ReleaseRateLimited(
+                                    provider.clone(),
+                                    incoming,
+                                )));
+                                Some(deadline.map_or(incoming, |old| old.max(incoming)))
+                            } else {
+                                no_command(app.dispatch(Message::ReleaseDone(
+                                    provider.clone(),
+                                    Ok("fixture-version".into()),
+                                )));
+                                deadline
+                            };
+                            assert_eq!(app.model.release_result.is_some(), action != 2);
+                            no_command(app.dispatch(Message::ReleaseRateLimited(
+                                provider.clone(),
+                                RetryDeadline::Blocked,
+                            )));
+                            no_command(app.dispatch(Message::ReleaseDone(
+                                provider,
+                                Err("duplicate provider completion".into()),
+                            )));
+                            expected
+                        } else {
+                            no_command(app.dispatch(Message::ReleaseRateLimited(
+                                first,
+                                RetryDeadline::At(Instant::now()),
+                            )));
+                            deadline
+                        };
+                        assert_eq!(app.model.release_retry_at, expected);
+                        assert!(app.model.release_worker.is_none());
+                        assert!(app.model.pending_release.is_none());
+
+                        let command = app.dispatch(Message::Rescan);
+                        no_command(app.dispatch(local_message(command)));
+                        no_command(app.dispatch(Message::Select(Product::Retail)));
+                        drop(app.view());
+                        no_command(app.dispatch(Message::NativeCheckDone));
+                        assert_no_release_work(&app.model);
+                        assert_eq!(app.model.release_retry_at, expected);
+                        if expected.is_some_and(|wait| !wait.allows(Instant::now())) {
+                            no_command(app.dispatch(Message::CheckRelease));
+                            assert_no_release_work(&app.model);
+                            assert_eq!(app.model.release_retry_at, expected);
+                        }
+                        assert_eq!(tree(wow.path()), after);
+                        assert_eq!(tree(data.path()), config_after);
+                    }
+                }
+            }
+        }
+
+        // Added 2026-10-28; original GPLv3 applies.
+        #[test]
+        fn restore_outcome_survives_independent_postinspection_failure() {
+            use ajour_core::fs::{
+                inspect_recovery, restore_originals_checked, RecoveryRestoreOutcome as Outcome,
+            };
+            use std::fs;
+
+            for kind in 0..4 {
+                for post_failure in [false, true] {
+                    let (wow, data, mut app, _) = fixture(true);
+                    let preview = plan(&mut app);
+                    let command = restore(&mut app, &preview);
+                    let request = app.model.pending_recovery.as_ref().unwrap().clone();
+                    let addons = request.addons.clone();
+
+                    match kind {
+                        2 => {
+                            let journal = addons.join(".patchloom-install/plan.yml");
+                            let mut bytes = fs::read(&journal).unwrap();
+                            bytes.extend_from_slice(b"\n# changed after GUI preview\n");
+                            fs::write(journal, bytes).unwrap();
+                        }
+                        3 => {
+                            // Preserve the original elsewhere in this fixture.
+                            // Inspection can report the missing backup; checked
+                            // restore must refuse to guess at its contents.
+                            fs::rename(
+                                addons
+                                    .join(".patchloom-install/backup")
+                                    .join(&preview.approval.originals()[0]),
+                                wow.path().join("preserved-original-for-error"),
+                            )
+                            .unwrap();
+                        }
+                        _ => {}
+                    }
+                    let before_worker = tree(wow.path());
+                    let config_before = tree(data.path());
+
+                    let message = if kind == 1 {
+                        // GUI's admitted worker callback always approves its
+                        // matching slices. Exercise real core cancellation
+                        // separately, then inject its completion envelope.
+                        drop(command.futures());
+                        let outcome = restore_originals_checked(
+                            &addons,
+                            preview.approval.as_ref(),
+                            |originals, retained| {
+                                assert_eq!(originals, preview.approval.originals());
+                                assert_eq!(retained, preview.approval.move_aside_if_present(),);
+                                false
+                            },
+                        )
+                        .map_err(|error| error.to_string());
+                        let inspection = inspect_recovery(&addons)
+                            .map(Arc::new)
+                            .map_err(|error| error.to_string());
+                        Message::RecoveryDone(
+                            request.clone(),
+                            RecoveryResult::Restore {
+                                outcome,
+                                inspection,
+                            },
+                        )
+                    } else {
+                        // Actual GUI Command -> blocking worker -> checked core
+                        // restore -> post-inspection -> completion message.
+                        local_message(command)
+                    };
+                    let (outcome, inspection) = match message {
+                        Message::RecoveryDone(
+                            echo,
+                            RecoveryResult::Restore {
+                                outcome,
+                                inspection,
+                            },
+                        ) => {
+                            assert!(echo.same_request(&request));
+                            (outcome, inspection)
+                        }
+                        other => panic!("Expected restore completion: {:?}", other),
+                    };
+                    match kind {
+                        0 => assert_eq!(outcome, Ok(Outcome::RestoredRetained)),
+                        1 => assert_eq!(outcome, Ok(Outcome::Cancelled)),
+                        2 => assert_eq!(outcome, Ok(Outcome::Changed)),
+                        _ => assert!(outcome.is_err()),
+                    }
+                    let inspection = inspection.unwrap();
+                    if kind != 0 {
+                        assert_eq!(tree(wow.path()), before_worker);
+                    }
+                    owns(&app, &request);
+                    assert!(app.model.recovery_outcome.is_none());
+                    assert!(app.model.recovery_post_error.is_none());
+
+                    let expected = outcome.clone();
+                    let after_worker = tree(wow.path());
+                    // Only this follow-up failure is synthetic. No phase pause
+                    // or failed filesystem inspection is claimed by this branch.
+                    let follow_up = if post_failure {
+                        Err("injected follow-up inspection failure".into())
+                    } else {
+                        Ok(inspection.clone())
+                    };
+                    no_command(app.dispatch(Message::RecoveryDone(
+                        request.clone(),
+                        RecoveryResult::Restore {
+                            outcome,
+                            inspection: follow_up,
+                        },
+                    )));
+                    assert_eq!(app.model.recovery_outcome, Some(expected.clone()));
+                    assert_eq!(
+                        app.model.recovery_post_error.as_deref(),
+                        post_failure.then_some("injected follow-up inspection failure"),
+                    );
+                    if post_failure {
+                        assert!(app.model.recovery_inspection.is_none());
+                    } else {
+                        assert!(Arc::ptr_eq(
+                            app.model.recovery_inspection.as_ref().unwrap(),
+                            &inspection,
+                        ));
+                    }
+                    assert!(app.model.recovery_error.is_none());
+                    assert!(app.model.recovery_preview.is_none());
+                    assert!(app.model.recovery_ack.is_empty());
+                    assert!(app.model.inventory.is_none());
+                    assert!(app.model.receipt.is_none());
+                    assert!(app.model.receipt_error.is_none());
+                    assert!(app.model.recovery_slot_available());
+
+                    let text = recovery_outcome_text(&expected);
+                    match kind {
+                        0 => {
+                            assert!(text.starts_with("Original folders restored."));
+                            assert!(text.contains("Updates remain blocked"));
+                        }
+                        1 => assert_eq!(text, "Restore cancelled. No addon folders were changed.",),
+                        2 => {
+                            assert!(text.starts_with("Recovery state changed."));
+                            assert!(text.contains("No restore was started."));
+                        }
+                        _ => {
+                            assert!(text.starts_with("Restore failed:"));
+                            assert!(text.contains("Some folders may already have moved."));
+                            assert!(!text.starts_with("Original folders restored."));
+                        }
+                    }
+
+                    // A duplicate cannot replace either saved result.
+                    no_command(app.dispatch(Message::RecoveryDone(
+                        request,
+                        RecoveryResult::Restore {
+                            outcome: Err("duplicate outcome".into()),
+                            inspection: Err("duplicate inspection".into()),
+                        },
+                    )));
+                    drop(app.view());
+                    assert_eq!(app.model.recovery_outcome, Some(expected));
+                    assert_eq!(
+                        app.model.recovery_post_error.as_deref(),
+                        post_failure.then_some("injected follow-up inspection failure"),
+                    );
+                    assert_eq!(tree(wow.path()), after_worker);
+                    assert_eq!(tree(data.path()), config_before);
+                    assert_no_release_work(&app.model);
+                }
+            }
+        }
+
+        #[test]
+        fn restore_admission_clears_ownership_displays_and_rejects_delayed_receipts() {
+            for prior_error in [false, true] {
+                let (wow, data, mut app, _) = fixture(true);
+                let preview = plan(&mut app);
+                let command = app.dispatch(Message::InspectReceipt);
+                let receipt = app.model.pending_receipt.as_ref().unwrap().clone();
+                drop(command.futures());
+                let result = if prior_error {
+                    Err("prior ownership error".into())
+                } else {
+                    Ok(matching_receipt(&receipt))
+                };
+                let delayed = Message::ReceiptDone(receipt, result);
+                no_command(app.dispatch(delayed.clone()));
+                assert_eq!(app.model.receipt.is_some(), !prior_error);
+                assert_eq!(app.model.receipt_error.is_some(), prior_error);
+                assert!(app.model.inventory.is_some());
+
+                let command = restore(&mut app, &preview);
+                let request = app.model.pending_recovery.as_ref().unwrap().clone();
+                // These assertions precede polling the restore command.
+                assert!(app.model.inventory.is_none());
+                assert!(app.model.error.is_none());
+                assert!(app.choices.is_empty());
+                assert!(app.model.receipt.is_none());
+                assert!(app.model.receipt_error.is_none());
+                assert!(app.model.pending_receipt.is_none());
+                no_command(app.dispatch(delayed.clone()));
+                owns(&app, &request);
+                assert!(app.model.receipt.is_none());
+                assert!(app.model.receipt_error.is_none());
+
+                let completed = local_message(command);
+                no_command(app.dispatch(delayed.clone()));
+                owns(&app, &request);
+                assert!(app.model.receipt.is_none());
+                assert!(app.model.receipt_error.is_none());
+                no_command(app.dispatch(completed));
+                assert!(matches!(
+                    app.model.recovery_outcome.as_ref(),
+                    Some(Ok(ajour_core::fs::RecoveryRestoreOutcome::RestoredRetained))
+                ));
+                let report = app.model.recovery_inspection.as_ref().unwrap().clone();
+                let after = tree(wow.path());
+                let config_after = tree(data.path());
+                no_command(app.dispatch(delayed.clone()));
+                assert!(app.model.receipt.is_none());
+                assert!(app.model.receipt_error.is_none());
+                assert!(Arc::ptr_eq(
+                    app.model.recovery_inspection.as_ref().unwrap(),
+                    &report,
+                ));
+
+                let scan = app.dispatch(Message::Rescan);
+                let token = app.model.scan.as_ref().unwrap().clone();
+                no_command(app.dispatch(delayed.clone()));
+                assert!(Arc::ptr_eq(app.model.scan.as_ref().unwrap(), &token));
+                finish(&mut app, scan);
+                no_command(app.dispatch(Message::Select(Product::Retail)));
+
+                let command = app.dispatch(Message::InspectReceipt);
+                let current = app.model.pending_receipt.as_ref().unwrap().clone();
+                no_command(app.dispatch(delayed));
+                assert!(Arc::ptr_eq(
+                    app.model.receipt_worker.as_ref().unwrap(),
+                    &current.token,
+                ));
+                assert!(Arc::ptr_eq(
+                    &app.model.pending_receipt.as_ref().unwrap().token,
+                    &current.token,
+                ));
+                assert!(app.model.receipt.is_none());
+                assert!(app.model.receipt_error.is_none());
+                // Finish the actual current ownership worker, whatever its
+                // honest fixture result; the injected old display cannot win.
+                finish(&mut app, command);
+                assert!(app.model.receipt_worker.is_none());
+                assert!(app.model.pending_receipt.is_none());
+                assert_eq!(tree(wow.path()), after);
+                assert_eq!(tree(data.path()), config_after);
+                assert_no_release_work(&app.model);
+            }
+        }
+
+        #[test]
+        fn recovery_paging_preserves_complete_approval_and_rejects_stale_messages() {
+            use std::fs;
+
+            let (wow, data, mut app, _) = fixture(true);
+            let old_root_preview = plan(&mut app);
+            let container = tempfile::tempdir().unwrap();
+            let mut root = container.path().canonicalize().unwrap();
+            for _ in 0..8 {
+                root = root.join("paging-scope-é-界-\u{202e}-abcdefghijklmnop");
+            }
+            fs::create_dir_all(&root).unwrap();
+            for entry in fs::read_dir(wow.path()).unwrap() {
+                let entry = entry.unwrap();
+                fs::rename(entry.path(), root.join(entry.file_name())).unwrap();
+            }
+            let addons = root
+                .join("_retail_/Interface/AddOns")
+                .canonicalize()
+                .unwrap();
+            let state = ajour_core::fs::inspect_recovery(&addons).unwrap();
+            let mut previous = state.previous;
+            for index in 0..(2 * FOLDERS_SHOWN + 3) {
+                let name = format!("Paging{index:03}_{}_\u{202e}_end", "界".repeat(65));
+                assert!(name.len() <= 255);
+                let backup = addons.join(".patchloom-install/backup").join(&name);
+                fs::create_dir(&backup).unwrap();
+                fs::write(backup.join("original.lua"), b"paging original").unwrap();
+                previous.push(name);
+            }
+            fs::write(
+                addons.join(".patchloom-install/plan.yml"),
+                serde_json::to_vec(&serde_json::json!({
+                    "version": 1,
+                    "previous": previous,
+                    "incoming": state.incoming,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            no_command(app.dispatch(Message::RootInputChanged(root.to_str().unwrap().into())));
+            let command = app.dispatch(Message::OpenRoot);
+            finish(&mut app, command);
+            no_command(app.dispatch(Message::Select(Product::Retail)));
+            let command = app.dispatch(Message::InspectRecovery);
+            finish(&mut app, command);
+            let command = app.dispatch(Message::PreviewRecovery);
+            finish(&mut app, command);
+            let old = app.model.recovery_preview.as_ref().unwrap().clone();
+            // A fresh real preflight replaces request/ticket identity.
+            let command = app.dispatch(Message::PreviewRecovery);
+            finish(&mut app, command);
+            let preview = app.model.recovery_preview.as_ref().unwrap().clone();
+            let originals = preview.approval.originals().to_vec();
+            let retained = preview.approval.move_aside_if_present().to_vec();
+            let canonical = preview.approval.root().to_path_buf();
+            let before = tree(container.path());
+            let config_before = tree(data.path());
+            no_command(app.dispatch(Message::RecoveryAckChanged(
+                preview.clone(),
+                "RESTORE".into(),
+            )));
+
+            let root_pages = recovery_root_pages(&canonical);
+            assert!(root_pages > 1);
+            let mut displayed_root = String::new();
+            for page in 0..root_pages {
+                no_command(app.dispatch(Message::RecoveryRootPage(preview.clone(), page)));
+                assert_eq!(app.recovery.root_page, page);
+                let chunk = recovery_root_chunk(&canonical, page);
+                assert!(chunk.is_ascii());
+                assert!(chunk.len() <= 10 * ERROR_CHARS);
+                displayed_root.push_str(&chunk);
+                drop(app.view());
+            }
+            assert_eq!(
+                displayed_root,
+                format!("{:?}", canonical.as_os_str())
+                    .escape_default()
+                    .to_string(),
+            );
+            let count = originals.len().max(retained.len());
+            let last = count.saturating_sub(1) / FOLDERS_SHOWN;
+            assert!(last >= 2);
+            for page in 0..=last {
+                no_command(app.dispatch(Message::RecoveryPage(preview.clone(), page)));
+                assert_eq!(app.model.recovery_page, page);
+                for folders in [&originals, &retained] {
+                    let text = recovery_folder_page(folders, page);
+                    let start = page * FOLDERS_SHOWN;
+                    let names: Vec<_> = folders.iter().skip(start).take(FOLDERS_SHOWN).collect();
+                    if names.is_empty() {
+                        assert_eq!(text, "No folders on this page.");
+                    } else {
+                        assert_eq!(text.lines().count(), names.len());
+                        for (offset, (line, name)) in text.lines().zip(names).enumerate() {
+                            assert_eq!(
+                                line,
+                                format!("{}. \"{}\"", start + offset + 1, name.escape_default(),)
+                            );
+                        }
+                    }
+                    assert!(text.is_ascii());
+                    assert!(!text.contains('\u{202e}'));
+                }
+                drop(app.view());
+            }
+            no_command(app.dispatch(Message::RecoveryPage(preview.clone(), usize::MAX)));
+            no_command(app.dispatch(Message::RecoveryRootPage(preview.clone(), usize::MAX)));
+            assert_eq!(app.model.recovery_page, last);
+            assert_eq!(app.recovery.root_page, root_pages - 1);
+
+            no_command(app.dispatch(Message::RecoveryPage(preview.clone(), 1)));
+            no_command(app.dispatch(Message::RecoveryRootPage(preview.clone(), 1)));
+            let mut stale = vec![old, old_root_preview.clone()];
+            for field in 0..7 {
+                let mut foreign = preview.clone();
+                match field {
+                    0 => foreign.request.root = foreign.request.root.join("foreign"),
+                    1 => foreign.request.addons = foreign.request.addons.join("foreign"),
+                    2 => foreign.request.product = Product::ClassicProgression,
+                    3 => foreign.request.generation = Arc::new(()),
+                    4 => foreign.request.token = Arc::new(()),
+                    5 => foreign.request.action = RecoveryAction::Inspect,
+                    _ => {
+                        foreign.approval =
+                            Arc::new(ajour_core::fs::preflight_restore_originals(&addons).unwrap())
+                    }
+                }
+                stale.push(foreign);
+            }
+            for stale in stale {
+                no_command(app.dispatch(Message::RecoveryPage(stale.clone(), 0)));
+                no_command(app.dispatch(Message::RecoveryRootPage(stale, 0)));
+                assert_eq!(app.model.recovery_page, 1);
+                assert_eq!(app.recovery.root_page, 1);
+            }
+
+            // Even current paging messages cannot change controls while the
+            // shared physical filesystem slot belongs to a receipt worker.
+            let command = app.dispatch(Message::InspectReceipt);
+            no_command(app.dispatch(Message::RecoveryPage(preview.clone(), 0)));
+            no_command(app.dispatch(Message::RecoveryRootPage(preview.clone(), 0)));
+            assert_eq!(app.model.recovery_page, 1);
+            assert_eq!(app.recovery.root_page, 1);
+            finish(&mut app, command);
+            assert_eq!(preview.approval.root(), canonical);
+            assert_eq!(preview.approval.originals(), originals);
+            assert_eq!(preview.approval.move_aside_if_present(), retained);
+            assert!(Arc::ptr_eq(
+                &app.model.recovery_preview.as_ref().unwrap().approval,
+                &preview.approval,
+            ));
+            assert_eq!(app.model.recovery_ack, "RESTORE");
+            assert_eq!(tree(container.path()), before);
+            assert_eq!(tree(data.path()), config_before);
+
+            let command = app.dispatch(Message::RestoreRecovery(preview.clone()));
+            let request = app.model.pending_recovery.as_ref().unwrap().clone();
+            owns(&app, &request);
+            no_command(app.dispatch(Message::RecoveryPage(preview.clone(), 1)));
+            no_command(app.dispatch(Message::RecoveryRootPage(preview.clone(), 1)));
+            assert_eq!(app.model.recovery_page, 0);
+            assert_eq!(app.recovery.root_page, 0);
+            finish(&mut app, command);
+            assert!(matches!(
+                app.model.recovery_outcome.as_ref(),
+                Some(Ok(ajour_core::fs::RecoveryRestoreOutcome::RestoredRetained))
+            ));
+            assert_eq!(preview.approval.originals(), originals);
+            assert_eq!(preview.approval.move_aside_if_present(), retained);
+            assert_eq!(tree(data.path()), config_before);
+            assert_no_release_work(&app.model);
+        }
+
+        #[test]
+        fn recovery_display_helpers_escape_controls_and_handle_empty_or_extreme_pages() {
+            for (name, expected) in [
+                ("A\nB", "1. \"A\\nB\""),
+                ("界\u{202e}", "1. \"\\u{754c}\\u{202e}\""),
+                ("\"\\", r#"1. "\"\\""#),
+            ] {
+                let names = vec![name.to_string()];
+                assert_eq!(recovery_folder_page(&names, 0), expected);
+                assert_eq!(names[0], name);
+                assert_eq!(
+                    recovery_folder_page(&names, usize::MAX),
+                    "No folders on this page.",
+                );
+            }
+            assert_eq!(recovery_folder_page(&[], 0), "None.");
+            assert_eq!(recovery_folder_page(&[], usize::MAX), "None.");
+            let path = PathBuf::from("root\nwith\tcontrols\u{202e}");
+            let expected = format!("{:?}", path.as_os_str())
+                .escape_default()
+                .to_string();
+            assert_eq!(recovery_root_pages(&path), 1);
+            assert_eq!(recovery_root_chunk(&path, usize::MAX), expected);
+            #[cfg(unix)]
+            {
+                use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+                let path = PathBuf::from(OsString::from_vec(b"root-\xff".to_vec()));
+                let shown: String = (0..recovery_root_pages(&path))
+                    .map(|page| recovery_root_chunk(&path, page))
+                    .collect();
+                assert_eq!(
+                    shown,
+                    format!("{:?}", path.as_os_str())
+                        .escape_default()
+                        .to_string(),
+                );
+                assert!(!shown.contains('\u{fffd}'));
+            }
+        }
+
+        #[test]
+        fn recovery_stays_idle_on_rootless_startup_render_and_native_timer_messages() {
+            let data = tempfile::tempdir().unwrap();
+            std::fs::write(data.path().join("config-sentinel"), b"unchanged").unwrap();
+            let before = tree(data.path());
+            for native_check in [false, true] {
+                let (mut app, command) = Preview::new(Flags {
+                    root: PathBuf::new(),
+                    native_check,
+                });
+                no_command(command);
+                let model_before = format!("{:?}", app.model);
+                let generation = app.model.generation.clone();
+                for _ in 0..3 {
+                    drop(app.view());
+                    assert_eq!(app.subscription().recipes().is_empty(), !native_check);
+                    no_command(app.dispatch(Message::InspectRecovery));
+                    no_command(app.dispatch(Message::PreviewRecovery));
+                    no_command(app.dispatch(Message::NativeCheckDone));
+                    assert!(app.should_exit());
+                    assert_eq!(format!("{:?}", app.model), model_before);
+                    assert!(Arc::ptr_eq(&app.model.generation, &generation));
+                    assert!(app.model.recovery_slot_available());
+                    assert_no_release_work(&app.model);
+                }
+            }
+            assert_eq!(tree(data.path()), before);
+        }
+
+        #[test]
+        fn recovery_preview_and_completed_states_do_not_act_on_render_or_timer() {
+            for native_check in [false, true] {
+                for state in 0..5 {
+                    let (wow, data, _, _) = fixture(true);
+                    let before_startup = tree(wow.path());
+                    let config_before = tree(data.path());
+                    let (mut app, command) = Preview::new(Flags {
+                        root: wow.path().into(),
+                        native_check,
+                    });
+                    assert!(app.model.recovery_job.is_none());
+                    assert!(app.model.pending_recovery.is_none());
+                    assert!(app.model.recovery_inspection.is_none());
+                    assert!(app.model.recovery_preview.is_none());
+                    assert_no_release_work(&app.model);
+                    let message = local_message(command);
+                    assert!(matches!(&message, Message::InventoryDone(..)));
+                    no_command(app.dispatch(message));
+                    no_command(app.dispatch(Message::Select(Product::Retail)));
+                    assert_eq!(tree(wow.path()), before_startup);
+                    assert!(app.model.recovery_inspection.is_none());
+                    assert!(app.model.recovery_outcome.is_none());
+
+                    if state != 0 {
+                        let preview = plan(&mut app);
+                        match state {
+                            1 => {
+                                no_command(app.dispatch(Message::RecoveryAckChanged(
+                                    preview,
+                                    "RESTORE".into(),
+                                )))
+                            }
+                            2 => {
+                                let command = restore(&mut app, &preview);
+                                finish(&mut app, command);
+                                assert!(matches!(
+                                    app.model.recovery_outcome.as_ref(),
+                                    Some(Ok(
+                                        ajour_core::fs::RecoveryRestoreOutcome::RestoredRetained
+                                    ))
+                                ));
+                            }
+                            3 => {
+                                no_command(app.dispatch(Message::CancelRecoveryPreview(preview)));
+                                assert!(app.model.recovery_preview.is_none());
+                                assert!(app.model.recovery_error.is_some());
+                            }
+                            _ => {
+                                std::fs::write(
+                                    preview.approval.root().join(".patchloom-install/plan.yml"),
+                                    b"version: [invalid",
+                                )
+                                .unwrap();
+                                let command = restore(&mut app, &preview);
+                                finish(&mut app, command);
+                                assert!(matches!(
+                                    app.model.recovery_outcome.as_ref(),
+                                    Some(Err(_))
+                                ));
+                                assert!(app.model.recovery_post_error.is_some());
+                            }
+                        }
+                    }
+                    let after = tree(wow.path());
+                    let model_before = format!("{:?}", app.model);
+                    let generation = app.model.generation.clone();
+                    let ticket = app
+                        .model
+                        .recovery_preview
+                        .as_ref()
+                        .map(|preview| preview.approval.clone());
+                    for _ in 0..3 {
+                        drop(app.view());
+                        assert_eq!(app.subscription().recipes().is_empty(), !native_check);
+                        no_command(app.dispatch(Message::NativeCheckDone));
+                        assert!(app.should_exit());
+                        assert_eq!(format!("{:?}", app.model), model_before);
+                        assert!(Arc::ptr_eq(&app.model.generation, &generation));
+                        if let Some(ticket) = &ticket {
+                            assert!(Arc::ptr_eq(
+                                &app.model.recovery_preview.as_ref().unwrap().approval,
+                                ticket,
+                            ));
+                            assert_eq!(app.model.recovery_ack, "RESTORE");
+                        }
+                        assert!(app.model.recovery_slot_available());
+                        assert!(app.model.pending_recovery.is_none());
+                        assert!(app.model.pending_receipt.is_none());
+                        assert!(app.model.scan.is_none());
+                        assert!(!app.model.scan_requested);
+                        assert_no_release_work(&app.model);
+                        assert_eq!(tree(wow.path()), after);
+                        assert_eq!(tree(data.path()), config_before);
+                    }
+                }
             }
         }
     }

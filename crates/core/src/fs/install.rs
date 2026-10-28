@@ -6,10 +6,10 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs::{self, File},
     io::{self, Read},
-    path::Path,
+    path::{Path, PathBuf},
 };
 use walkdir::WalkDir;
 
@@ -578,12 +578,26 @@ pub fn inspect_recovery(directory: &Path) -> Result<RecoveryInspection> {
 }
 
 fn read_plan(transaction: &Path) -> Result<Plan> {
+    let metadata = fs::symlink_metadata(transaction)?;
+    if is_link(&metadata) || !metadata.is_dir() {
+        return Err(invalid("Invalid transaction directory").into());
+    }
     let plan_path = transaction.join("plan.yml");
-    let file = File::open(plan_path)?;
-    if file.metadata()?.len() > 1024 * 1024 {
+    let metadata = fs::symlink_metadata(&plan_path)?;
+    if is_link(&metadata) || !metadata.is_file() {
+        return Err(invalid("Invalid install journal file").into());
+    }
+    if metadata.len() > 1024 * 1024 {
         return Err(invalid("Oversized install journal").into());
     }
-    let plan: Plan = serde_yaml::from_reader(file)?;
+    let mut bytes = Vec::new();
+    File::open(plan_path)?
+        .take(1024 * 1024 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > 1024 * 1024 {
+        return Err(invalid("Oversized install journal").into());
+    }
+    let plan: Plan = serde_yaml::from_slice(&bytes)?;
     for names in [&plan.previous, &plan.incoming] {
         let mut seen = HashSet::new();
         for name in names {
@@ -678,33 +692,80 @@ fn validate_restore_state(
     Ok(())
 }
 
-/// Restore the complete original bundle after an explicit, locked preview.
-/// Current destinations are moved aside, never deleted. Retained state blocks updates.
-pub fn restore_originals(
-    directory: &Path,
-    confirm: impl FnOnce(&[String], &[String]) -> bool,
-) -> Result<bool> {
-    if is_link(&fs::symlink_metadata(directory)?) || !directory.is_dir() {
+// Modified 2026-10-28; original Ajour GPLv3 applies.
+
+/// A validated, content-bound preview, not authorization to write.
+/// Private fields prevent construction from journal data; tickets are not serialized.
+#[derive(Debug)]
+pub struct RecoveryApproval {
+    root: PathBuf,
+    originals: Vec<String>,
+    move_aside: Vec<String>,
+    contents: BTreeMap<String, String>,
+}
+
+impl RecoveryApproval {
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn originals(&self) -> &[String] {
+        &self.originals
+    }
+
+    /// Affected names; existing current folders will be retained, not deleted.
+    pub fn move_aside_if_present(&self) -> &[String] {
+        &self.move_aside
+    }
+}
+
+/// Only RestoredRetained means all original-folder moves completed.
+/// Errors after mutation may leave partial retained state requiring inspection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryRestoreOutcome {
+    Cancelled,
+    Changed,
+    RestoredRetained,
+}
+
+struct RestoreState {
+    original: Plan,
+    plan: Plan,
+    resuming: bool,
+    restoring: bool,
+}
+
+fn recovery_root(directory: &Path) -> Result<PathBuf> {
+    let metadata = fs::symlink_metadata(directory)?;
+    if is_link(&metadata) || !metadata.is_dir() {
         return Err(invalid("AddOns root must be an existing directory, not a link").into());
     }
-    let root = directory.canonicalize()?;
+    Ok(directory.canonicalize()?)
+}
+
+fn recovery_lock(directory: &Path) -> Result<(PathBuf, File)> {
+    let root = recovery_root(directory)?;
     let lock_path = root.join(LOCK);
     let metadata = fs::symlink_metadata(&lock_path)?;
     if is_link(&metadata) || !metadata.is_file() {
         return Err(invalid("Invalid install lock file").into());
     }
+    // Open only the existing lock: preflight never creates persistent state.
     let lock = File::options().read(true).write(true).open(lock_path)?;
     lock.try_lock()
         .map_err(|_| invalid("Installation is busy; retry recovery later"))?;
+    Ok((root, lock))
+}
+
+// Read bounded, plain journal files first. Recursive validation follows the
+// bounded snapshot for approval calls; legacy calls retain their existing checks.
+fn restore_state(root: &Path) -> Result<RestoreState> {
     let transaction = root.join(TRANSACTION);
-    plain_tree(&transaction)?;
     let original = read_plan(&transaction)?;
-    validate_transaction(&transaction, &original)?;
     if original.previous.is_empty() || !marker(&transaction.join("ready"))? {
         return Err(invalid("No interrupted original bundle is available to restore").into());
     }
-    let workspace = root.join(RESTORE);
-    let names: Vec<String> = original
+    let names = original
         .previous
         .iter()
         .chain(&original.incoming)
@@ -717,52 +778,172 @@ pub fn restore_originals(
         previous: names,
         incoming: original.previous.clone(),
     };
+    let workspace = root.join(RESTORE);
     let resuming = exists(&workspace)?;
     let restoring = if resuming {
-        plain_tree(&workspace)?;
         let saved = read_plan(&workspace)?;
-        if saved.previous != plan.previous || saved.incoming != plan.incoming {
+        if saved != plan {
             return Err(invalid("Recovery plan changed; all versions retained").into());
         }
-        validate_transaction(&workspace, &plan)?;
-        if !marker(&workspace.join("ready"))? && !marker(&workspace.join("committed"))? {
+        let ready = marker(&workspace.join("ready"))?;
+        let committed = marker(&workspace.join("committed"))?;
+        if !ready && !committed {
             return Err(invalid("Incomplete recovery preparation; all versions retained").into());
         }
-        marker(&workspace.join("committed"))?
+        committed
     } else {
         false
     };
-    validate_restore_state(
-        &root,
-        &transaction,
-        &workspace,
-        &original,
-        &plan,
+    Ok(RestoreState {
+        original,
+        plan,
         resuming,
         restoring,
-    )?;
-    if !confirm(&plan.incoming, &plan.previous) {
-        return Ok(false);
+    })
+}
+
+fn validate_recovery(root: &Path, state: &RestoreState) -> Result<()> {
+    validate_restore_state(
+        root,
+        &root.join(TRANSACTION),
+        &root.join(RESTORE),
+        &state.original,
+        &state.plan,
+        state.resuming,
+        state.restoring,
+    )
+}
+
+// Modified 2026-10-28; original Ajour GPLv3 applies.
+fn recovery_contents(root: &Path, state: &RestoreState) -> io::Result<BTreeMap<String, String>> {
+    // The held OS lock supplies exclusion; its bytes are not journal authority.
+    // Validate the mutex entry without reopening and reading the locked file.
+    let metadata = fs::symlink_metadata(root.join(LOCK))?;
+    if is_link(&metadata) || !metadata.is_file() {
+        return Err(invalid("Invalid install lock file"));
     }
-    validate_restore_state(
-        &root,
-        &transaction,
-        &workspace,
-        &original,
-        &plan,
-        resuming,
-        restoring,
-    )?;
-    if !resuming {
+    let mut names = vec![TRANSACTION.into(), RESTORE.into()];
+    names.extend(state.plan.previous.iter().cloned());
+    // Whole journal trees include plans, markers, receipt bytes, staged data,
+    // originals and retained replacements. Absent affected destinations count too.
+    super::ownership::snapshot_paths(root, &names)
+}
+
+/// Validate and preview restoration while holding the existing installation lock.
+/// Creates no files or directories. The returned ticket still requires fresh consent.
+/// Bounds: 10,000 snapshot entries, 128 MiB/file, 512 MiB total, 64 path components,
+/// 1,024-byte relative paths, and 10,000 direct children during root enumeration.
+/// Scope covers recovery contents/types/membership, not timestamps or object identity.
+/// The existing mutex must be a plain file and remain locked during validation;
+/// its bytes are not recovery state and are not included in the approval snapshot.
+pub fn preflight_restore_originals(directory: &Path) -> Result<RecoveryApproval> {
+    let (root, _lock) = recovery_lock(directory)?;
+    let state = restore_state(&root)?;
+    let contents = recovery_contents(&root, &state)?;
+    validate_recovery(&root, &state)?;
+    Ok(RecoveryApproval {
+        root,
+        originals: state.plan.incoming,
+        move_aside: state.plan.previous,
+        contents,
+    })
+}
+
+// Snapshot before recursive validators so unsupported or oversized relevant trees
+// are refused without an unbounded recursive validation pass.
+fn matches_recovery_approval(
+    root: &Path,
+    state: &RestoreState,
+    approval: Option<&RecoveryApproval>,
+) -> Result<bool> {
+    let contents = match approval {
+        Some(_) => Some(recovery_contents(root, state)?),
+        None => None,
+    };
+    validate_recovery(root, state)?;
+    Ok(match (approval, contents) {
+        (Some(approved), Some(current)) => {
+            approved.root == root
+                && approved.originals == state.plan.incoming
+                && approved.move_aside == state.plan.previous
+                && approved.contents == current
+        }
+        (None, None) => true,
+        _ => false,
+    })
+}
+
+/// Restore only if the locked state still matches the reviewed ticket.
+/// Checks contents before consent and again after consent, before the first write.
+/// Changed means a valid state/scope comparison failed; invalid state or IO fails
+/// through Result::Err. Neither outcome authorizes automatic retry.
+pub fn restore_originals_checked(
+    directory: &Path,
+    approval: &RecoveryApproval,
+    confirm: impl FnOnce(&[String], &[String]) -> bool,
+) -> Result<RecoveryRestoreOutcome> {
+    restore_originals_shared(directory, Some(approval), confirm)
+}
+
+/// Restore the complete original bundle after an explicit, locked preview.
+/// Current destinations are moved aside, never deleted. Retained state blocks updates.
+pub fn restore_originals(
+    directory: &Path,
+    confirm: impl FnOnce(&[String], &[String]) -> bool,
+) -> Result<bool> {
+    match restore_originals_shared(directory, None, confirm)? {
+        RecoveryRestoreOutcome::Cancelled => Ok(false),
+        RecoveryRestoreOutcome::RestoredRetained => Ok(true),
+        RecoveryRestoreOutcome::Changed => {
+            Err(invalid("Recovery root changed; all versions retained").into())
+        }
+    }
+}
+
+fn restore_originals_shared(
+    directory: &Path,
+    approval: Option<&RecoveryApproval>,
+    confirm: impl FnOnce(&[String], &[String]) -> bool,
+) -> Result<RecoveryRestoreOutcome> {
+    let (root, _lock) = recovery_lock(directory)?;
+    if approval.is_some_and(|approved| approved.root != root) {
+        return Ok(RecoveryRestoreOutcome::Changed);
+    }
+    let state = restore_state(&root)?;
+    if !matches_recovery_approval(&root, &state, approval)? {
+        return Ok(RecoveryRestoreOutcome::Changed);
+    }
+    if !confirm(&state.plan.incoming, &state.plan.previous) {
+        return Ok(RecoveryRestoreOutcome::Cancelled);
+    }
+    if recovery_root(directory)? != root {
+        return Ok(RecoveryRestoreOutcome::Changed);
+    }
+    if !matches_recovery_approval(&root, &state, approval)? {
+        return Ok(RecoveryRestoreOutcome::Changed);
+    }
+    // The same lock remains owned through the final check and every guarded move.
+    // ponytail: cooperative writers only; hostile writers and power loss need
+    // platform-specific work. No guarantee covers changes after this final check.
+    perform_restore(&root, &state)?;
+    Ok(RecoveryRestoreOutcome::RestoredRetained)
+}
+
+// The sole restore mutation path, shared by the legacy CLI and checked API.
+fn perform_restore(root: &Path, state: &RestoreState) -> Result<()> {
+    let transaction = root.join(TRANSACTION);
+    let workspace = root.join(RESTORE);
+    let plan = &state.plan;
+    if !state.resuming {
         fs::create_dir(&workspace)?;
         let file = File::create_new(workspace.join("plan.yml"))?;
-        serde_yaml::to_writer(&file, &plan)?;
+        serde_yaml::to_writer(&file, plan)?;
         file.sync_all()?;
         fs::create_dir(workspace.join("backup"))?;
         fs::create_dir(workspace.join("staged"))?;
         File::create_new(workspace.join("ready"))?.sync_all()?;
     }
-    if !restoring {
+    if !state.restoring {
         for name in &plan.previous {
             let current = root.join(name);
             if exists(&current)? {
@@ -780,7 +961,7 @@ pub fn restore_originals(
                 plain_tree(&current)?;
                 fs::rename(current, retained)?;
                 #[cfg(all(test, windows, feature = "no-self-update"))]
-                process_tests::checkpoint(&root, "restore-retained");
+                process_tests::checkpoint(root, "restore-retained");
             }
         }
         fs::rename(workspace.join("ready"), workspace.join("committed"))?;
@@ -796,20 +977,16 @@ pub fn restore_originals(
         if !backup.is_dir() {
             return Err(invalid("Original folder type changed; all versions retained").into());
         }
-        {
-            if exists(&root.join(name))? {
-                return Err(
-                    invalid("Restore destination occupied; original backup retained").into(),
-                );
-            }
-            plain_tree(&backup)?;
-            fs::rename(backup, root.join(name))?;
-            #[cfg(all(test, windows, feature = "no-self-update"))]
-            process_tests::checkpoint(&root, "restore-original");
+        if exists(&root.join(name))? {
+            return Err(invalid("Restore destination occupied; original backup retained").into());
         }
+        plain_tree(&backup)?;
+        fs::rename(backup, root.join(name))?;
+        #[cfg(all(test, windows, feature = "no-self-update"))]
+        process_tests::checkpoint(root, "restore-original");
     }
     // Deliberately retain the journal and replacement folders until cleanup is explicitly reviewed.
-    Ok(true)
+    Ok(())
 }
 
 // Restart recovery never deletes an AddOns destination based on journal claims alone.
@@ -1116,6 +1293,560 @@ mod tests {
         fs::create_dir(transaction.join("committed")).unwrap();
         assert!(inspect_recovery(&root).is_err());
         assert!(transaction.join("backup/Foo/old.lua").exists());
+    }
+
+    // Added 2026-10-28; original Ajour GPLv3 applies.
+    // Test-only inventory: includes empty directories and links, never follows links.
+    fn approval_tree(root: &Path) -> BTreeMap<PathBuf, (u8, Vec<u8>)> {
+        fn visit(root: &Path, path: &Path, out: &mut BTreeMap<PathBuf, (u8, Vec<u8>)>) {
+            let metadata = fs::symlink_metadata(path).unwrap();
+            let (kind, bytes) = if is_link(&metadata) {
+                (
+                    2,
+                    fs::read_link(path)
+                        .unwrap()
+                        .as_os_str()
+                        .to_string_lossy()
+                        .as_bytes()
+                        .to_vec(),
+                )
+            } else if metadata.is_dir() {
+                (0, Vec::new())
+            } else {
+                assert!(metadata.is_file(), "unexpected fixture type");
+                (1, fs::read(path).unwrap())
+            };
+            out.insert(path.strip_prefix(root).unwrap().into(), (kind, bytes));
+            if kind == 0 {
+                for entry in fs::read_dir(path).unwrap() {
+                    visit(root, &entry.unwrap().path(), out);
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        visit(root, root, &mut out);
+        out
+    }
+
+    // Uses the supplied restore_fixture's Foo-only plan, not a new journal format.
+    fn approval_workspace(root: &Path, transaction: &Path, committed: bool) {
+        let workspace = root.join(RESTORE);
+        fs::create_dir_all(workspace.join("backup")).unwrap();
+        fs::create_dir(workspace.join("staged")).unwrap();
+        fs::copy(transaction.join("plan.yml"), workspace.join("plan.yml")).unwrap();
+        fs::write(
+            workspace.join(if committed { "committed" } else { "ready" }),
+            b"",
+        )
+        .unwrap();
+        fs::rename(root.join("Foo"), workspace.join("backup/Foo")).unwrap();
+    }
+
+    fn approval_content_path(root: &Path, transaction: &Path, location: usize) -> PathBuf {
+        match location {
+            0 => transaction.join("backup/Foo/old.lua"),
+            1 => root.join("Foo/new.lua"),
+            2 | 3 => {
+                approval_workspace(root, transaction, location == 3);
+                root.join(RESTORE).join("backup/Foo/new.lua")
+            }
+            _ => panic!("unknown fixture location"),
+        }
+    }
+
+    fn approval_change(path: &Path, change: usize) {
+        match change {
+            0 => {
+                let mut bytes = fs::read(path).unwrap();
+                bytes[0] ^= 1; // Same length and names, different content.
+                fs::write(path, bytes).unwrap();
+            }
+            1 => fs::create_dir(path.parent().unwrap().join("added-empty")).unwrap(),
+            2 => fs::remove_file(path).unwrap(),
+            3 => {
+                fs::remove_file(path).unwrap();
+                fs::create_dir(path).unwrap();
+            }
+            _ => panic!("unknown fixture change"),
+        }
+    }
+
+    fn approval_changed_without_consent(root: &Path, ticket: &RecoveryApproval) {
+        let before = approval_tree(root);
+        assert_eq!(
+            restore_originals_checked(root, ticket, |_, _| panic!("stale consent")).unwrap(),
+            RecoveryRestoreOutcome::Changed
+        );
+        assert_eq!(approval_tree(root), before);
+    }
+
+    #[test]
+    fn approval_preflight_and_cancel_preserve_all_persistent_fixture_state() {
+        for phase in 0..3 {
+            let (temp, root, transaction) = restore_fixture();
+            if phase != 0 {
+                approval_workspace(&root, &transaction, phase == 2);
+            }
+            let before = approval_tree(temp.path());
+            let ticket = preflight_restore_originals(&root).unwrap();
+            assert_eq!(approval_tree(temp.path()), before);
+            assert_eq!(ticket.root(), root.canonicalize().unwrap());
+            assert_eq!(ticket.originals(), ["Foo"]);
+            assert_eq!(ticket.move_aside_if_present(), ["Foo"]);
+            let mut calls = 0;
+            let outcome = restore_originals_checked(&root, &ticket, |originals, retained| {
+                calls += 1;
+                assert_eq!(originals, ticket.originals());
+                assert_eq!(retained, ticket.move_aside_if_present());
+                assert!(
+                    preflight_restore_originals(&root).is_err(),
+                    "lock must stay held"
+                );
+                false
+            })
+            .unwrap();
+            assert_eq!(calls, 1);
+            assert_eq!(outcome, RecoveryRestoreOutcome::Cancelled);
+            assert_eq!(approval_tree(temp.path()), before);
+        }
+        let (temp, _addon, _downloads, root) = fixture();
+        let before = approval_tree(temp.path());
+        assert!(preflight_restore_originals(&root).is_err());
+        assert_eq!(approval_tree(temp.path()), before);
+        assert!(!root.join(LOCK).exists());
+
+        let (temp, root, _transaction) = restore_fixture();
+        let ticket = preflight_restore_originals(&root).unwrap();
+        fs::remove_file(root.join(LOCK)).unwrap();
+        let before = approval_tree(temp.path());
+        assert!(preflight_restore_originals(&root).is_err());
+        assert!(restore_originals_checked(&root, &ticket, |_, _| panic!("missing lock")).is_err());
+        assert_eq!(approval_tree(temp.path()), before);
+    }
+
+    #[test]
+    fn approval_unchanged_consent_restores_bundle_and_retains_versions_and_journals() {
+        let (temp, root, transaction) = restore_fixture();
+        let mut plan = read_plan(&transaction).unwrap();
+        plan.previous.push("Bar".into());
+        plan.incoming.push("New".into());
+        fs::write(
+            transaction.join("plan.yml"),
+            serde_yaml::to_string(&plan).unwrap(),
+        )
+        .unwrap();
+        fs::create_dir(transaction.join("backup/Bar")).unwrap();
+        fs::write(transaction.join("backup/Bar/old.lua"), b"original-bar").unwrap();
+        for (name, bytes) in [
+            ("Bar", b"replacement-bar".as_slice()),
+            ("New", b"additional"),
+        ] {
+            fs::create_dir(root.join(name)).unwrap();
+            fs::write(root.join(name).join("new.lua"), bytes).unwrap();
+        }
+        for path in [
+            temp.path().join("WTF/Account/SavedVariables"),
+            root.join("WTF"),
+            root.join("SavedVariables"),
+            root.join("Unrelated"),
+        ] {
+            fs::create_dir_all(&path).unwrap();
+            fs::write(path.join("keep.lua"), b"untouched").unwrap();
+        }
+        let unrelated = [
+            temp.path().join("WTF"),
+            root.join("WTF"),
+            root.join("SavedVariables"),
+            root.join("Unrelated"),
+        ];
+        let before: Vec<_> = unrelated.iter().map(|p| approval_tree(p)).collect();
+        let journal = fs::read(transaction.join("plan.yml")).unwrap();
+        let ticket = preflight_restore_originals(&root).unwrap();
+        let mut calls = 0;
+        let outcome = restore_originals_checked(&root, &ticket, |originals, retained| {
+            calls += 1;
+            assert_eq!(originals, ticket.originals());
+            assert_eq!(retained, ticket.move_aside_if_present());
+            assert!(!root.join(RESTORE).exists(), "consent precedes first write");
+            assert!(preflight_restore_originals(&root).is_err(), "same lock");
+            true
+        })
+        .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(outcome, RecoveryRestoreOutcome::RestoredRetained);
+        assert_eq!(fs::read(root.join("Foo/old.lua")).unwrap(), b"original");
+        assert_eq!(fs::read(root.join("Bar/old.lua")).unwrap(), b"original-bar");
+        for (name, bytes) in [
+            ("Foo", b"replacement".as_slice()),
+            ("Bar", b"replacement-bar"),
+            ("New", b"additional"),
+        ] {
+            assert_eq!(
+                fs::read(root.join(RESTORE).join("backup").join(name).join("new.lua")).unwrap(),
+                bytes
+            );
+        }
+        assert!(!root.join("New").exists());
+        assert_eq!(fs::read(transaction.join("plan.yml")).unwrap(), journal);
+        assert!(transaction.join("ready").is_file());
+        assert!(transaction.join("backup").is_dir());
+        assert!(transaction.join("staged").is_dir());
+        assert!(root.join(RESTORE).join("committed").is_file());
+        let saved = read_plan(&root.join(RESTORE)).unwrap();
+        assert_eq!(saved.incoming, ticket.originals());
+        assert_eq!(saved.previous, ticket.move_aside_if_present());
+        for (path, expected) in unrelated.iter().zip(before) {
+            assert_eq!(approval_tree(path), expected);
+        }
+        let report = inspect_recovery(&root).unwrap();
+        assert_eq!(
+            report.restore_phase.as_deref(),
+            Some("restoring-or-restored")
+        );
+        assert_eq!(report.retained_replacements, ["Bar", "Foo", "New"]);
+        let after = approval_tree(temp.path());
+        assert!(recover(&root).is_err());
+        assert!(preflight_restore_originals(&root).is_err());
+        assert!(
+            restore_originals_checked(&root, &ticket, |_, _| panic!("replayed ticket")).is_err()
+        );
+        assert_eq!(approval_tree(temp.path()), after);
+    }
+
+    #[test]
+    fn approval_binds_bytes_membership_and_types_in_every_relevant_content_tree() {
+        for location in 0..4 {
+            for change in 0..4 {
+                let (_temp, root, transaction) = restore_fixture();
+                let path = approval_content_path(&root, &transaction, location);
+                let ticket = preflight_restore_originals(&root).unwrap();
+                approval_change(&path, change);
+                approval_changed_without_consent(&root, &ticket);
+            }
+        }
+    }
+
+    #[test]
+    fn approval_binds_raw_journals_staging_metadata_and_absent_destinations() {
+        for restore_journal in [false, true] {
+            let (_temp, root, transaction) = restore_fixture();
+            if restore_journal {
+                approval_workspace(&root, &transaction, false);
+            }
+            let journal = if restore_journal {
+                root.join(RESTORE).join("plan.yml")
+            } else {
+                transaction.join("plan.yml")
+            };
+            let plan = read_plan(journal.parent().unwrap()).unwrap();
+            let ticket = preflight_restore_originals(&root).unwrap();
+            File::options()
+                .append(true)
+                .open(&journal)
+                .unwrap()
+                .write_all(b"\n# same parsed plan; new bytes\n")
+                .unwrap();
+            assert!(read_plan(journal.parent().unwrap()).unwrap() == plan);
+            approval_changed_without_consent(&root, &ticket);
+        }
+        for staged in [false, true] {
+            let (_temp, root, transaction) = restore_fixture();
+            let path = if staged {
+                fs::create_dir(transaction.join("staged/Foo")).unwrap();
+                transaction.join("staged/Foo/payload")
+            } else {
+                transaction.join("receipt.json")
+            };
+            fs::write(&path, b"{}").unwrap();
+            let ticket = preflight_restore_originals(&root).unwrap();
+            fs::write(&path, b"{ }").unwrap();
+            approval_changed_without_consent(&root, &ticket);
+        }
+        let (_temp, root, transaction) = restore_fixture();
+        let mut plan = read_plan(&transaction).unwrap();
+        plan.incoming.push("New".into());
+        fs::write(
+            transaction.join("plan.yml"),
+            serde_yaml::to_string(&plan).unwrap(),
+        )
+        .unwrap();
+        let ticket = preflight_restore_originals(&root).unwrap();
+        fs::create_dir(root.join("New")).unwrap();
+        approval_changed_without_consent(&root, &ticket);
+    }
+
+    #[test]
+    fn approval_checks_content_again_after_callback_before_any_restore_mutation() {
+        for location in 0..5 {
+            let (temp, root, transaction) = restore_fixture();
+            let path = if location == 4 {
+                transaction.join("plan.yml")
+            } else {
+                approval_content_path(&root, &transaction, location)
+            };
+            let ticket = preflight_restore_originals(&root).unwrap();
+            // Inventory before lock acquisition, including actual mutex bytes.
+            let mut expected = approval_tree(temp.path());
+            let mut calls = 0;
+            let outcome = restore_originals_checked(&root, &ticket, |_, _| {
+                calls += 1;
+                assert!(
+                    preflight_restore_originals(&root).is_err(),
+                    "callback holds lock"
+                );
+                if location == 4 {
+                    File::options()
+                        .append(true)
+                        .open(&path)
+                        .unwrap()
+                        .write_all(b"\n# callback change\n")
+                        .unwrap();
+                } else {
+                    approval_change(&path, 0);
+                }
+                // Only this fixture file was deliberately changed. Do not reopen
+                // the held mutex via a recursive inventory inside the callback.
+                expected.insert(
+                    path.strip_prefix(temp.path()).unwrap().to_path_buf(),
+                    (1, fs::read(&path).unwrap()),
+                );
+                true
+            })
+            .unwrap();
+            assert_eq!(calls, 1);
+            assert_eq!(outcome, RecoveryRestoreOutcome::Changed);
+            // Lock released: compare every entry and byte, including the mutex.
+            assert_eq!(approval_tree(temp.path()), expected);
+            if location < 2 || location == 4 {
+                assert!(!root.join(RESTORE).exists());
+            }
+        }
+    }
+
+    #[test]
+    fn approval_rejects_foreign_root_busy_lock_and_invalid_original_without_writes() {
+        let (a, root, transaction) = restore_fixture();
+        let (b, other, _other_transaction) = restore_fixture();
+        let ticket = preflight_restore_originals(&root).unwrap();
+        let before_a = approval_tree(a.path());
+        let before_b = approval_tree(b.path());
+        approval_changed_without_consent(&other, &ticket);
+        assert_eq!(approval_tree(a.path()), before_a);
+        assert_eq!(approval_tree(b.path()), before_b);
+        let lock = File::options()
+            .read(true)
+            .write(true)
+            .open(root.join(LOCK))
+            .unwrap();
+        lock.lock().unwrap();
+        assert!(preflight_restore_originals(&root).is_err());
+        assert!(restore_originals_checked(&root, &ticket, |_, _| panic!("busy lock")).is_err());
+        // Inventory reads the mutex too, so perform it only after releasing
+        // this test-owned lock. Production must not release its lock early.
+        drop(lock);
+        assert_eq!(approval_tree(a.path()), before_a);
+        fs::rename(
+            transaction.join("backup/Foo"),
+            a.path().join("preserved-original"),
+        )
+        .unwrap();
+        let before = approval_tree(a.path());
+        assert!(preflight_restore_originals(&root).is_err());
+        assert!(
+            restore_originals_checked(&root, &ticket, |_, _| panic!("missing original")).is_err()
+        );
+        assert_eq!(approval_tree(a.path()), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn approval_rejects_unix_links_at_root_lock_journal_marker_and_content() {
+        use std::os::unix::fs::symlink;
+        for location in 0..8 {
+            let (temp, root, transaction) = restore_fixture();
+            if location == 7 {
+                approval_workspace(&root, &transaction, false);
+            }
+            let ticket = preflight_restore_originals(&root).unwrap();
+            let outside = temp.path().join("outside");
+            fs::write(&outside, b"outside sentinel").unwrap();
+            let mut selected = root.clone();
+            match location {
+                0 => {
+                    selected = temp.path().join("alias");
+                    symlink(&root, &selected).unwrap();
+                }
+                1 => {
+                    fs::remove_file(root.join(LOCK)).unwrap();
+                    symlink(&outside, root.join(LOCK)).unwrap();
+                }
+                2 => {
+                    let saved = temp.path().join("saved-plan");
+                    fs::rename(transaction.join("plan.yml"), &saved).unwrap();
+                    symlink(saved, transaction.join("plan.yml")).unwrap();
+                }
+                3 => {
+                    let saved = temp.path().join("saved-journal");
+                    fs::rename(&transaction, &saved).unwrap();
+                    symlink(saved, &transaction).unwrap();
+                }
+                4 => symlink(&outside, transaction.join("backup/Foo/link")).unwrap(),
+                5 => symlink(&outside, root.join("Foo/link")).unwrap(),
+                6 => {
+                    fs::remove_file(transaction.join("ready")).unwrap();
+                    fs::write(&outside, b"").unwrap();
+                    symlink(&outside, transaction.join("ready")).unwrap();
+                }
+                7 => symlink(&outside, root.join(RESTORE).join("backup/Foo/link")).unwrap(),
+                _ => unreachable!(),
+            }
+            let before = approval_tree(temp.path());
+            assert!(preflight_restore_originals(&selected).is_err());
+            assert!(
+                restore_originals_checked(&selected, &ticket, |_, _| panic!("linked state"))
+                    .is_err()
+            );
+            assert_eq!(approval_tree(temp.path()), before);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn approval_rejects_windows_junctions_without_touching_targets() {
+        use std::os::windows::process::CommandExt;
+        for location in 0..5 {
+            let (temp, root, transaction) = restore_fixture();
+            if location == 3 {
+                approval_workspace(&root, &transaction, false);
+            }
+            let ticket = preflight_restore_originals(&root).unwrap();
+            let outside = temp.path().join("outside");
+            fs::create_dir(&outside).unwrap();
+            fs::write(outside.join("keep"), b"outside sentinel").unwrap();
+            let (alias, target) = match location {
+                0 => (temp.path().join("alias"), root.clone()),
+                1 => (transaction.join("backup/Foo/link"), outside.clone()),
+                2 => (root.join("Foo/link"), outside.clone()),
+                3 => (root.join(RESTORE).join("backup/Foo/link"), outside.clone()),
+                4 => {
+                    let saved = temp.path().join("saved-journal");
+                    fs::rename(&transaction, &saved).unwrap();
+                    (transaction.clone(), saved)
+                }
+                _ => unreachable!(),
+            };
+            let output = std::process::Command::new("cmd.exe")
+                .args(["/d", "/c", "mklink", "/J"])
+                .arg(alias.components().collect::<PathBuf>())
+                .arg(target.components().collect::<PathBuf>())
+                .creation_flags(0x08000000)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(is_link(&fs::symlink_metadata(&alias).unwrap()));
+            let selected = if location == 0 { &alias } else { &root };
+            let before = approval_tree(temp.path());
+            assert!(preflight_restore_originals(selected).is_err());
+            assert!(
+                restore_originals_checked(selected, &ticket, |_, _| panic!("reparse state"))
+                    .is_err()
+            );
+            assert_eq!(approval_tree(temp.path()), before);
+            fs::remove_dir(&alias).unwrap(); // Unlink this fixture junction, not its target.
+            assert_eq!(fs::read(outside.join("keep")).unwrap(), b"outside sentinel");
+        }
+    }
+
+    // Added 2026-10-28; original Ajour GPLv3 applies.
+    #[test]
+    fn approval_mutex_bytes_are_not_authority_and_are_never_written_by_recovery() {
+        for restore in [false, true] {
+            let (temp, root, transaction) = restore_fixture();
+            fs::write(root.join(LOCK), b"mutex bytes before preview").unwrap();
+            let before = approval_tree(temp.path());
+            let ticket = preflight_restore_originals(&root).unwrap();
+            assert_eq!(approval_tree(temp.path()), before);
+            assert!(!ticket.contents.contains_key(LOCK));
+
+            // Explicit generic snapshots still hash this filename.
+            let mutex_before = crate::fs::ownership::snapshot_paths(&root, &[LOCK.into()]).unwrap();
+            let mutex_bytes = b"different mutex bytes, not a recovery plan";
+            fs::write(root.join(LOCK), mutex_bytes).unwrap();
+            let mutex_after = crate::fs::ownership::snapshot_paths(&root, &[LOCK.into()]).unwrap();
+            assert_ne!(mutex_before, mutex_after);
+
+            let before_cancel = approval_tree(temp.path());
+            let mut calls = 0;
+            let outcome = restore_originals_checked(&root, &ticket, |originals, retained| {
+                calls += 1;
+                assert_eq!(originals, ticket.originals());
+                assert_eq!(retained, ticket.move_aside_if_present());
+                assert!(preflight_restore_originals(&root).is_err());
+                false
+            })
+            .unwrap();
+            assert_eq!(calls, 1);
+            assert_eq!(outcome, RecoveryRestoreOutcome::Cancelled);
+            assert_eq!(approval_tree(temp.path()), before_cancel);
+            assert!(!root.join(RESTORE).exists());
+
+            if restore {
+                let journal = fs::read(transaction.join("plan.yml")).unwrap();
+                assert_eq!(
+                    restore_originals_checked(&root, &ticket, |_, _| {
+                        assert!(preflight_restore_originals(&root).is_err());
+                        true
+                    })
+                    .unwrap(),
+                    RecoveryRestoreOutcome::RestoredRetained
+                );
+                assert_eq!(fs::read(root.join("Foo/old.lua")).unwrap(), b"original");
+                assert_eq!(
+                    fs::read(root.join(RESTORE).join("backup/Foo/new.lua")).unwrap(),
+                    b"replacement"
+                );
+                assert_eq!(fs::read(transaction.join("plan.yml")).unwrap(), journal);
+                assert!(transaction.join("ready").is_file());
+                assert!(root.join(RESTORE).join("committed").is_file());
+            }
+            assert_eq!(fs::read(root.join(LOCK)).unwrap(), mutex_bytes);
+        }
+    }
+
+    #[test]
+    fn approval_still_requires_an_existing_plain_mutex_file() {
+        for directory in [false, true] {
+            let (temp, root, _transaction) = restore_fixture();
+            let ticket = preflight_restore_originals(&root).unwrap();
+            fs::remove_file(root.join(LOCK)).unwrap();
+            if directory {
+                fs::create_dir(root.join(LOCK)).unwrap();
+            }
+            let before = approval_tree(temp.path());
+            assert!(preflight_restore_originals(&root).is_err());
+            assert!(
+                restore_originals_checked(&root, &ticket, |_, _| panic!("invalid mutex")).is_err()
+            );
+            assert_eq!(approval_tree(temp.path()), before);
+            assert!(!root.join(RESTORE).exists());
+        }
+    }
+
+    #[test]
+    fn approval_hashes_mutex_named_files_inside_all_relevant_content_trees() {
+        for location in 0..4 {
+            let (_temp, root, transaction) = restore_fixture();
+            let content = approval_content_path(&root, &transaction, location);
+            let nested = content.parent().unwrap().join(LOCK);
+            fs::write(&nested, b"bound recovery content").unwrap();
+            let ticket = preflight_restore_originals(&root).unwrap();
+            approval_change(&nested, 0);
+            approval_changed_without_consent(&root, &ticket);
+        }
     }
 
     fn restore_fixture() -> (TempDir, PathBuf, PathBuf) {
@@ -1790,5 +2521,20 @@ mod tests {
         assert!(!root.join("New").exists());
         assert_eq!(fs::read(root.join("Foo/old.lua")).unwrap(), b"original");
         assert!(!transaction.exists());
+    }
+
+    #[test]
+    fn approval_rejects_oversized_journal_without_creating_restore_state() {
+        let (temp, root, transaction) = restore_fixture();
+        File::options()
+            .write(true)
+            .open(transaction.join("plan.yml"))
+            .unwrap()
+            .set_len(1024 * 1024 + 1)
+            .unwrap();
+        let before = approval_tree(temp.path());
+        assert!(preflight_restore_originals(&root).is_err());
+        assert_eq!(approval_tree(temp.path()), before);
+        assert!(!root.join(RESTORE).exists());
     }
 }
