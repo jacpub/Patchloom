@@ -93,9 +93,13 @@ WoW installation or your normal application configuration.
 
 | Target | Reported validation |
 | --- | --- |
-| Windows x64 | Local retry correction: 121 tests per configuration, explicit paired receipt bridge, strict Clippy and formatting pass |
-| Linux x64 | Published base `14ed00ca9422f16f1526b5bd44acedf3797d278c`: Ubuntu 24.04 CI green, 80 tests per configuration |
+| Windows x64 | 121 tests/config; strict Clippy and formatting pass |
+| Linux x64 | Published base: CI green, 80 tests/config |
 | macOS | Native build, runtime and packaging validation pending |
+
+The Windows checks also include the explicit paired receipt bridge.
+The Linux result is for Ubuntu 24.04 at commit
+`14ed00ca9422f16f1526b5bd44acedf3797d278c`.
 
 The Windows row covers the local retry correction. The Linux row covers the
 published base; hosted CI for this correction has not run. Native macOS/Linux
