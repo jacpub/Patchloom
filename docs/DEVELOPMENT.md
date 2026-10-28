@@ -8,12 +8,16 @@ Use a disposable copied WoW root with `.build.info` and product directories:
 cargo run --bin ajour --locked --features no-self-update -- --preview <copied-WoW-root>
 ```
 
-The preview has its own startup path. It reads the supplied root without loading
-legacy configuration, starting self-update, contacting providers or creating
-application directories. Choose a detected product to inspect its addon folders.
-Rescan clears that choice. Unknown products and unresolved TOCs remain visible
-for review; the preview never chooses a fallback product or installs an update.
-Keep using copied fixtures while development continues.
+The isolated preview reads the selected copied WoW folder. It contacts GitHub only
+when you select a WoW version, enter a valid public owner/repository and click
+Check release. Startup, input edits, selection changes, rescans and the headless
+check do not start provider requests. The check reads release metadata and the
+release manifest; it never downloads addon ZIPs or installs addons. A compatible
+release does not establish that an addon is installed, owned or up to date.
+
+The preview uses its own startup path without loading legacy configuration,
+starting self-update or creating application directories. Unknown products and
+unresolved TOCs remain visible for review. Keep using copied development fixtures.
 
 Add `--preview-check` to construct the same model and view without opening a
 window. It prints JSON and exits unsuccessfully when discovery needs review.
@@ -22,10 +26,11 @@ window and exits after a short timer. Do not combine either check mode with
 legacy commands, `--data` or `--self-update-temp`.
 
 Starting the executable without `--preview` still enters the legacy application.
-The preview is an inventory milestone, with provider actions and recovery UI
-still to come. Its neutral draft surfaces await review against the saved
-Patchloom brand guide. Windows OpenGL startup has been checked with copied
-fixtures; visible layout, native macOS and Linux runtime checks remain pending.
+The preview includes inventory, ownership receipt inspection and explicit release
+checks. GUI installation, recovery and default-startup migration remain
+unfinished. Its neutral draft surfaces await review against the saved Patchloom
+brand guide. Windows OpenGL startup has been checked with copied fixtures;
+visible layout and native macOS/Linux GUI runtime checks remain pending.
 
 ## Restoring a retained original bundle
 
@@ -86,16 +91,20 @@ explicit recovery. Recovery UI and further platform checks remain unfinished.
 Use disposable fixtures for development; do not run these builds against a live
 WoW installation or your normal application configuration.
 
-| Target | Validation completed so far |
+| Target | Reported validation |
 | --- | --- |
-| Windows x64 | 37 local tests, including four process-interruption tests |
-| Linux x64 | Ubuntu 24.04 CI builds and 33 tests per configuration |
+| Windows x64 | Local retry correction: 121 tests per configuration, explicit paired receipt bridge, strict Clippy and formatting pass |
+| Linux x64 | Published base `14ed00ca9422f16f1526b5bd44acedf3797d278c`: Ubuntu 24.04 CI green, 80 tests per configuration |
 | macOS | Native build, runtime and packaging validation pending |
+
+The Windows row covers the local retry correction. The Linux row covers the
+published base; hosted CI for this correction has not run. Native macOS/Linux
+GUI checks remain pending.
 
 Windows and Linux checks use Rust 1.99.1 with self-update disabled. One catalog
 network test is excluded. Linux does not run the Windows-only subprocess tests.
-Strict Clippy still reports existing code issues, so overall CI is not fully
-passing. These results do not certify released packages or live addon updates.
+The reported results do not certify released packages or live addon updates.
+
 See the [installer development notes](SAFE_INSTALL_DEVELOPMENT.md) and
 [CI workflow](../.github/workflows/continuous-integration.yml) for details.
 
@@ -202,8 +211,9 @@ The report selects a TOC candidate only when exactly one recognized filename
 declares the exact client interface. It does not reproduce the full game loader:
 older interfaces, qualified Interface headers and unrecognized suffixes remain
 unresolved. A selected candidate does not certify addon compatibility or permit
-installation. PTR and other unlisted products are unsupported. There is no GUI
-integration or configuration migration in this milestone.
+installation. PTR and other unlisted products are unsupported. The isolated GUI
+preview integrates inventory, receipt inspection and explicit release checks.
+Default-startup configuration migration remains unfinished.
 
 Reads are bounded to 1 MiB per metadata file, 64 MiB of TOCs per discovery,
 10,000 build rows or addon entries per product, and 64 build-info columns.
@@ -226,7 +236,13 @@ across products, release channels or providers.
 Downloads require HTTPS without URL credentials. Redirects stay on the same
 origin, with GitHub release downloads also allowed to reach
 `release-assets.githubusercontent.com`. There are at most five redirects and a
-120-second timeout per download request (30 seconds for metadata). Metadata is
+120-second timeout per download request (30 seconds for metadata).
+These are per-request timeouts, not a deadline for a whole fetch or release
+check. Each fetch permits an initial request and up to five redirects. A release
+check performs two metadata fetches, giving a conservative timeout budget of
+about 360 seconds plus overhead. This is not measured latency or a guarantee
+that every redirect chain is allowed. Local inventory and receipt checks remain
+available while the release check runs. Metadata is
 limited to 1 MiB and archives to 128 MiB. HTTP errors, encoded bodies, incomplete
 streams and size or digest mismatches fail before publication. The downloader
 uses an owned temporary file and never replaces an existing download. A forced
@@ -241,8 +257,9 @@ selected product TOC. Callers must explicitly supply previously owned folders;
 discovery does not establish repository ownership. `matches_release` compares
 the returned receipt with remote metadata and does not verify later changes on
 disk. Receipt-based updates and the inspection command check saved content
-hashes separately. GUI integration and the recovery cleanup flow are still
-required before public beta.
+hashes separately. GUI inventory, receipt inspection and explicit release checks
+are integrated. GUI installation, recovery and the recovery cleanup flow remain
+unfinished before public beta.
 
 The SHA-256 implementation uses `sha2` 0.10.9 and seven new locked crypto
 packages including `sha2`. Its CPU-detection dependency requires a newer `libc`,
@@ -260,10 +277,41 @@ This establishes a download contract for that observed release, not compatibilit
 or coverage of every repository. The probe is ignored during normal tests and
 requires `PATCHLOOM_PUBLIC_GITHUB_PROBE=1` when explicitly invoked.
 GitHub documents public unauthenticated reads with a 60-request/hour primary
-limit per originating IP. The adapter makes no automatic retries on HTTP errors;
-callers must respect rate-limit responses before requesting again. See GitHub's
-[rate-limit documentation](https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api)
-and the [packager manifest source](https://github.com/BigWigsMods/packager/blob/master/release.sh).
+limit per originating IP. The adapter makes no automatic retries.
+
+The rate-aware correction carries a typed wait from the HTTP response into the
+preview. HTTP 429 establishes a rate limit. HTTP 403 establishes one only when
+a valid Retry-After value or x-ratelimit-remaining: 0 supplies rate evidence;
+other 403 responses remain ordinary HTTP failures.
+
+The correction reads Retry-After delay seconds or strict IMF-fixdate, and
+x-ratelimit-reset Unix seconds when the remaining count is zero or the status
+is 429. When both applicable hints are valid, the later wait wins. Missing,
+ambiguous or unsupported hints use a one-hour fallback when no usable hint
+remains. Obsolete HTTP-date forms are unsupported. Past dates and zero delays
+receive the minimum wait of 60 seconds. Longer server waits remain intact. If a
+wait cannot be represented safely, checks stay paused for this preview session.
+Absolute timestamps
+depend on the local wall clock when received; the resulting GUI deadline uses
+a monotonic clock.
+
+The preview retains the wait across repository edits, product changes and
+rescans. A matching physical completion establishes the wait even if its
+display result is stale. Foreign or duplicate completions cannot change the
+wait or release another worker. This is a conservative preview-wide pause,
+not a persistent or application-wide rate limiter. Restarting the preview
+does not preserve it, and CLI/library callers receive the typed error without
+an enforced retry scheduler.
+
+Check release remains clickable during the wait, but admission rejects early
+clicks without starting a request. The displayed remaining time is a snapshot,
+not a live countdown. Expiry sends nothing; a later explicit click is required.
+Local inventory and receipt checks remain available.
+
+On 2026-10-28, six core loopback tests passed for rate-limit responses and
+typed errors. Six GUI dispatch tests passed using injected typed completions.
+These are separate checks. They do not establish a single HTTP-to-GUI path or
+instrument the provider result mapper, Clipboard wrapper or timer stream.
 
 Offline fixtures cover the selected-product update/recheck loop, incompatible
 and malicious ZIPs, HTTP failures, truncation, byte limits, timeouts, redirects,

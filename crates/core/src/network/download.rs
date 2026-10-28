@@ -11,7 +11,7 @@ use std::{
     fs,
     io::{self, Write},
     path::Path,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 const MAX_DOWNLOAD: u64 = 128 * 1024 * 1024;
@@ -37,6 +37,103 @@ fn redirect_allowed(from: &Uri, to: &Uri) -> bool {
         || (from.host() == Some("github.com")
             && to.host() == Some("release-assets.githubusercontent.com")
             && to.port_u16().is_none())
+}
+
+// Modified 2026-10-28; original GPLv3 applies.
+// Modified 2026-10-28; original GPLv3 applies.
+const MIN_RATE_WAIT: u64 = 60;
+const FALLBACK_RATE_WAIT: u64 = 60 * 60;
+
+// Reject duplicate, oversized and non-text values. Never retain header text.
+fn rate_header<'a>(headers: &'a isahc::http::HeaderMap, name: &str) -> Option<&'a str> {
+    let mut values = headers.get_all(name).iter();
+    let value = values.next()?;
+    if values.next().is_some() || value.as_bytes().len() > 64 {
+        return None;
+    }
+    value.to_str().ok().map(str::trim)
+}
+
+fn rate_number(value: &str) -> Option<u64> {
+    if value.is_empty() || !value.bytes().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    Some(value.bytes().fold(0u64, |number, ch| {
+        number
+            .saturating_mul(10)
+            .saturating_add(u64::from(ch - b'0'))
+    }))
+}
+
+// Strict IMF-fixdate, using the existing chrono dependency.
+// Round-trip validation rejects alternate spellings, spacing and weekdays.
+fn rate_date(value: &str) -> Option<u64> {
+    const FORMAT: &str = "%a, %d %b %Y %H:%M:%S GMT";
+    if value.len() != 29 || !value.is_ascii() {
+        return None;
+    }
+    let date = chrono::NaiveDateTime::parse_from_str(value, FORMAT).ok()?;
+    if chrono::Timelike::nanosecond(&date) != 0 || date.format(FORMAT).to_string() != value {
+        return None;
+    }
+    let timestamp = date.timestamp();
+    if timestamp < 0 {
+        return None;
+    }
+    Some(timestamp as u64)
+}
+
+// Duration::MAX is the fail-closed marker for saturated numeric input.
+// It must never become a shorter finite GUI wait.
+fn rate_delay(seconds: u64) -> Duration {
+    if seconds == u64::MAX {
+        Duration::MAX
+    } else {
+        Duration::from_secs(seconds)
+    }
+}
+
+fn rate_until(timestamp: u64, now: SystemTime) -> Duration {
+    if timestamp == u64::MAX {
+        return Duration::MAX;
+    }
+    match now.duration_since(UNIX_EPOCH) {
+        Ok(elapsed) => Duration::from_secs(timestamp).saturating_sub(elapsed),
+        Err(_) => Duration::MAX,
+    }
+}
+
+fn rate_wait(
+    code: isahc::http::StatusCode,
+    headers: &isahc::http::HeaderMap,
+    now: SystemTime,
+) -> Option<Duration> {
+    let retry_after = rate_header(headers, "retry-after").and_then(|value| {
+        rate_number(value)
+            .map(rate_delay)
+            .or_else(|| rate_date(value).map(|date| rate_until(date, now)))
+    });
+    let exhausted = rate_header(headers, "x-ratelimit-remaining").and_then(rate_number) == Some(0);
+
+    if code != isahc::http::StatusCode::TOO_MANY_REQUESTS
+        && !(code == isahc::http::StatusCode::FORBIDDEN && (exhausted || retry_after.is_some()))
+    {
+        return None;
+    }
+
+    let reset = if exhausted || code == isahc::http::StatusCode::TOO_MANY_REQUESTS {
+        rate_header(headers, "x-ratelimit-reset")
+            .and_then(rate_number)
+            .map(|reset| rate_until(reset, now))
+    } else {
+        None
+    };
+    let wait = match (retry_after, reset) {
+        (Some(retry), Some(reset)) => retry.max(reset),
+        (Some(wait), None) | (None, Some(wait)) => wait,
+        (None, None) => Duration::from_secs(FALLBACK_RATE_WAIT),
+    };
+    Some(wait.max(Duration::from_secs(MIN_RATE_WAIT)))
 }
 
 async fn receive(
@@ -83,11 +180,20 @@ async fn receive(
             continue;
         }
         if response.status() != 200 {
+            if let Some(retry_after) =
+                rate_wait(response.status(), response.headers(), SystemTime::now())
+            {
+                return Err(DownloadError::RateLimited {
+                    code: response.status(),
+                    retry_after,
+                });
+            }
             return Err(DownloadError::InvalidStatusCode {
                 code: response.status(),
                 url: "download endpoint (no automatic retries)".into(),
             });
         }
+
         if response
             .headers()
             .get(header::CONTENT_ENCODING)
@@ -509,6 +615,661 @@ mod tests {
             assert_eq!(result.is_ok(), redirects == 1);
             assert_eq!(dest.exists(), redirects == 1);
             worker.join().unwrap();
+        }
+    }
+
+    // Added 2026-10-28; original GPLv3 applies.
+    mod rate_retry {
+        use super::super::*;
+        use isahc::http::{HeaderMap, HeaderValue, StatusCode};
+
+        fn headers(entries: &[(&'static str, &str)]) -> HeaderMap {
+            let mut headers = HeaderMap::new();
+            for &(name, value) in entries {
+                headers.append(name, HeaderValue::from_str(value).unwrap());
+            }
+            headers
+        }
+
+        fn wait(code: StatusCode, entries: &[(&'static str, &str)]) -> Option<u64> {
+            rate_wait(
+                code,
+                &headers(entries),
+                UNIX_EPOCH + Duration::from_secs(784_111_777),
+            )
+            .map(|wait| wait.as_secs())
+        }
+
+        #[test]
+        fn status_and_actual_rate_evidence_control_classification() {
+            use StatusCode as S;
+
+            for (code, evidence, expected) in [
+                (S::TOO_MANY_REQUESTS, vec![], Some(3_600)),
+                (S::FORBIDDEN, vec![], None),
+                (S::FORBIDDEN, vec![("retry-after", "120")], Some(120)),
+                (
+                    S::FORBIDDEN,
+                    vec![("x-ratelimit-remaining", "0")],
+                    Some(3_600),
+                ),
+                (S::FORBIDDEN, vec![("x-ratelimit-remaining", "1")], None),
+                (S::FORBIDDEN, vec![("x-ratelimit-reset", "784111957")], None),
+                (S::FORBIDDEN, vec![("retry-after", "invalid")], None),
+                (S::UNAUTHORIZED, vec![("retry-after", "120")], None),
+                (S::INTERNAL_SERVER_ERROR, vec![("retry-after", "120")], None),
+                (S::OK, vec![("x-ratelimit-remaining", "0")], None),
+            ] {
+                assert_eq!(wait(code, &evidence), expected, "{code}: {evidence:?}");
+            }
+        }
+
+        #[test]
+        fn delay_seconds_preserve_long_minima_and_overflow_fails_closed() {
+            for (value, expected) in [
+                ("0", Duration::from_secs(60)),
+                ("59", Duration::from_secs(60)),
+                ("60", Duration::from_secs(60)),
+                ("120", Duration::from_secs(120)),
+                ("86400", Duration::from_secs(86_400)),
+                ("86401", Duration::from_secs(86_401)),
+                ("172800", Duration::from_secs(172_800)),
+                ("18446744073709551615", Duration::MAX),
+                ("18446744073709551616", Duration::MAX),
+            ] {
+                assert_eq!(
+                    rate_wait(
+                        StatusCode::TOO_MANY_REQUESTS,
+                        &headers(&[("retry-after", value)]),
+                        UNIX_EPOCH,
+                    ),
+                    Some(expected),
+                    "{}",
+                    value,
+                );
+            }
+        }
+
+        #[test]
+        fn applicable_reset_and_retry_after_use_the_later_wait() {
+            let code = StatusCode::TOO_MANY_REQUESTS;
+            assert_eq!(wait(code, &[("x-ratelimit-reset", "784111957")]), Some(180),);
+            assert_eq!(
+                wait(
+                    code,
+                    &[("retry-after", "120"), ("x-ratelimit-reset", "784111957"),]
+                ),
+                Some(180),
+            );
+            assert_eq!(
+                wait(
+                    code,
+                    &[("retry-after", "240"), ("x-ratelimit-reset", "784111957"),]
+                ),
+                Some(240),
+            );
+            assert_eq!(
+                wait(
+                    StatusCode::FORBIDDEN,
+                    &[
+                        ("x-ratelimit-remaining", "0"),
+                        ("x-ratelimit-reset", "784111957"),
+                    ]
+                ),
+                Some(180),
+            );
+            // A non-exhausted primary reset does not extend a secondary-limit hint.
+            assert_eq!(
+                wait(
+                    StatusCode::FORBIDDEN,
+                    &[
+                        ("retry-after", "120"),
+                        ("x-ratelimit-remaining", "1"),
+                        ("x-ratelimit-reset", "784115377"),
+                    ]
+                ),
+                Some(120),
+            );
+            for (reset, expected) in [
+                ("784111777", 60),
+                ("0", 60),
+                ("784198178", 86_401),
+                ("18446744073709551616", u64::MAX),
+                ("invalid", 3_600),
+            ] {
+                assert_eq!(
+                    wait(code, &[("x-ratelimit-reset", reset)]),
+                    Some(expected),
+                    "{}",
+                    reset,
+                );
+            }
+        }
+
+        #[test]
+        fn imf_fixdate_uses_the_supplied_clock_and_wait_bounds() {
+            assert_eq!(
+                rate_date("Sun, 06 Nov 1994 08:49:37 GMT"),
+                Some(784_111_777),
+            );
+            assert_eq!(
+                rate_date("Thu, 29 Feb 2024 00:00:00 GMT"),
+                Some(1_709_164_800),
+            );
+            for (date, expected) in [
+                ("Sun, 06 Nov 1994 08:50:37 GMT", 60),
+                ("Sun, 06 Nov 1994 08:51:37 GMT", 120),
+                ("Sun, 06 Nov 1994 08:49:37 GMT", 60),
+                ("Sat, 05 Nov 1994 08:49:37 GMT", 60),
+                ("Tue, 08 Nov 1994 08:49:37 GMT", 172_800),
+            ] {
+                assert_eq!(
+                    wait(StatusCode::FORBIDDEN, &[("retry-after", date)]),
+                    Some(expected),
+                    "{date}",
+                );
+            }
+
+            for invalid in [
+                "Sunday, 06-Nov-94 08:49:37 GMT",
+                "Sun Nov  6 08:49:37 1994",
+                "Wed, 29 Feb 2023 00:00:00 GMT",
+                "Tue, 29 Feb 2100 00:00:00 GMT",
+                "Sun, 31 Apr 2024 00:00:00 GMT",
+                "Sun, 06 Nov 1994 24:00:00 GMT",
+                "Sun, 06 Nov 1994 08:60:00 GMT",
+                "Sun, 06 Nov 1994 08:49:60 GMT",
+                "Sun, 06 Nov 1994 08:49:37 UTC",
+                "Sun, 06 Nov 1969 08:49:37 GMT",
+            ] {
+                assert_eq!(rate_date(invalid), None, "{invalid}");
+                assert_eq!(
+                    wait(StatusCode::TOO_MANY_REQUESTS, &[("retry-after", invalid)]),
+                    Some(3_600),
+                    "{invalid}",
+                );
+                assert_eq!(
+                    wait(StatusCode::FORBIDDEN, &[("retry-after", invalid)]),
+                    None,
+                    "{invalid}",
+                );
+            }
+        }
+
+        #[test]
+        fn malformed_ambiguous_or_oversized_hints_do_not_create_evidence() {
+            for value in ["", "-1", "+120", "1.5", "120 seconds", "120, 240"] {
+                assert_eq!(
+                    wait(StatusCode::TOO_MANY_REQUESTS, &[("retry-after", value)]),
+                    Some(3_600),
+                );
+                assert_eq!(wait(StatusCode::FORBIDDEN, &[("retry-after", value)]), None,);
+            }
+
+            let duplicate = [("retry-after", "120"), ("retry-after", "240")];
+            assert_eq!(wait(StatusCode::FORBIDDEN, &duplicate), None);
+            assert_eq!(wait(StatusCode::TOO_MANY_REQUESTS, &duplicate), Some(3_600),);
+
+            let oversized = "9".repeat(65);
+            assert_eq!(
+                wait(StatusCode::FORBIDDEN, &[("retry-after", &oversized)]),
+                None,
+            );
+            assert_eq!(
+                wait(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    &[("retry-after", &oversized)]
+                ),
+                Some(3_600),
+            );
+
+            // Reject the ambiguous hint, but retain independent valid evidence/hints.
+            assert_eq!(
+                wait(
+                    StatusCode::FORBIDDEN,
+                    &[
+                        ("x-ratelimit-remaining", "0"),
+                        ("retry-after", "120"),
+                        ("retry-after", "240"),
+                        ("x-ratelimit-reset", "784111957"),
+                    ]
+                ),
+                Some(180),
+            );
+            assert_eq!(
+                wait(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    &[
+                        ("x-ratelimit-reset", "784111957"),
+                        ("x-ratelimit-reset", "784112017"),
+                    ]
+                ),
+                Some(3_600),
+            );
+        }
+
+        #[test]
+        fn long_server_minima_and_overflow_dominate_shorter_hints() {
+            let now = UNIX_EPOCH + Duration::from_secs(784_111_777);
+            for entries in [
+                vec![
+                    ("retry-after", "172800"),
+                    ("x-ratelimit-reset", "784198178"),
+                ],
+                vec![("retry-after", "60"), ("x-ratelimit-reset", "784284577")],
+                vec![
+                    ("retry-after", "Tue, 08 Nov 1994 08:49:37 GMT"),
+                    ("x-ratelimit-reset", "784198178"),
+                ],
+            ] {
+                assert_eq!(
+                    rate_wait(StatusCode::TOO_MANY_REQUESTS, &headers(&entries), now),
+                    Some(Duration::from_secs(172_800)),
+                );
+            }
+            for entries in [
+                vec![
+                    ("retry-after", "18446744073709551616"),
+                    ("x-ratelimit-reset", "784111897"),
+                ],
+                vec![
+                    ("retry-after", "120"),
+                    ("x-ratelimit-reset", "18446744073709551616"),
+                ],
+            ] {
+                assert_eq!(
+                    rate_wait(StatusCode::TOO_MANY_REQUESTS, &headers(&entries), now),
+                    Some(Duration::MAX),
+                );
+            }
+        }
+
+        #[test]
+        fn absolute_minima_preserve_fractional_precision_and_fail_closed_clock() {
+            let entries = headers(&[
+                ("retry-after", "Sun, 06 Nov 1994 08:51:37 GMT"),
+                ("x-ratelimit-reset", "784111958"),
+            ]);
+            let now = UNIX_EPOCH + Duration::new(784_111_777, 500_000_000);
+            assert_eq!(
+                rate_wait(StatusCode::TOO_MANY_REQUESTS, &entries, now),
+                Some(Duration::new(180, 500_000_000)),
+            );
+            let before_epoch = UNIX_EPOCH.checked_sub(Duration::from_secs(1)).unwrap();
+            assert_eq!(
+                rate_wait(StatusCode::FORBIDDEN, &entries, before_epoch),
+                Some(Duration::MAX),
+            );
+        }
+
+        #[test]
+        fn chrono_parser_requires_exact_imf_form_and_matching_weekday() {
+            for invalid in [
+                "Mon, 06 Nov 1994 08:49:37 GMT",
+                "sun, 06 Nov 1994 08:49:37 GMT",
+                "Sun, 6 Nov 1994 08:49:37 GMT",
+                "Sun, 06 nov 1994 08:49:37 GMT",
+                "Sun, 06 Nov 1994 08:49:37 +0000",
+                "Sun, 06 Nov 1994 08:49:37 GMT ",
+                "Sun, 06 Nov 1994 08:49:60 GMT",
+            ] {
+                assert_eq!(rate_date(invalid), None, "{}", invalid);
+            }
+            assert_eq!(
+                rate_date("Sat, 01 Jan 2000 00:00:00 GMT"),
+                Some(946_684_800),
+            );
+        }
+    }
+
+    // Added 2026-10-28; original GPLv3 applies.
+    mod rate_transport {
+        use super::*;
+        use isahc::http::StatusCode;
+
+        type Boxed = Box<dyn std::error::Error + Send + Sync>;
+
+        fn response(code: u16, headers: &[(&str, &str)]) -> Vec<u8> {
+            let mut response = format!("HTTP/1.1 {} Fixture\r\nConnection: close\r\n", code,);
+            for &(name, value) in headers {
+                response.push_str(name);
+                response.push_str(": ");
+                response.push_str(value);
+                response.push_str("\r\n");
+            }
+            response.push_str("Content-Length: 3\r\n\r\nbad");
+            response.into_bytes()
+        }
+
+        // Real response -> shared receive. No parser-only substitute.
+        fn receive_error(code: u16, headers: &[(&str, &str)]) -> DownloadError {
+            let url = server(response(code, headers));
+            let mut sink = Vec::new();
+            let error = async_std::task::block_on(receive(
+                &url,
+                1024,
+                None,
+                None,
+                Duration::from_secs(2),
+                &mut sink,
+            ))
+            .unwrap_err();
+            assert!(sink.is_empty(), "An HTTP error body reached the sink");
+            error
+        }
+
+        fn assert_error(error: &DownloadError, code: u16, expected_wait: Option<Duration>) {
+            let expected_code = StatusCode::from_u16(code).unwrap();
+            match (error, expected_wait) {
+                (DownloadError::RateLimited { code, retry_after }, Some(expected)) => {
+                    assert_eq!(*code, expected_code);
+                    assert_eq!(*retry_after, expected);
+                }
+                (DownloadError::InvalidStatusCode { code, .. }, None) => {
+                    assert_eq!(*code, expected_code);
+                }
+                other => panic!("Unexpected transport outcome: {:?}", other),
+            }
+        }
+
+        #[test]
+        fn real_responses_distinguish_429_evidenced_403_and_other_errors() {
+            for (code, headers, expected) in [
+                (429, vec![], Some(Duration::from_secs(3600))),
+                (403, vec![], None),
+                (
+                    403,
+                    vec![("X-RateLimit-Remaining", "0")],
+                    Some(Duration::from_secs(3600)),
+                ),
+                (
+                    403,
+                    vec![("Retry-After", "120")],
+                    Some(Duration::from_secs(120)),
+                ),
+                (
+                    403,
+                    vec![("X-RateLimit-Remaining", "1"), ("Retry-After", "120")],
+                    Some(Duration::from_secs(120)),
+                ),
+                (403, vec![("X-RateLimit-Reset", "253402300799")], None),
+                (
+                    403,
+                    vec![
+                        ("X-RateLimit-Remaining", "1"),
+                        ("X-RateLimit-Reset", "253402300799"),
+                    ],
+                    None,
+                ),
+                (403, vec![("Retry-After", "invalid")], None),
+                (401, vec![("Retry-After", "120")], None),
+                (500, vec![("X-RateLimit-Remaining", "0")], None),
+            ] {
+                assert_error(&receive_error(code, &headers), code, expected);
+            }
+        }
+
+        #[test]
+        fn real_delay_headers_preserve_long_minima_and_overflow_marker() {
+            for code in [429, 403] {
+                for (value, expected) in [
+                    ("0", Duration::from_secs(60)),
+                    ("59", Duration::from_secs(60)),
+                    ("86401", Duration::from_secs(86_401)),
+                    ("172800", Duration::from_secs(172_800)),
+                    ("18446744073709551615", Duration::MAX),
+                    ("18446744073709551616", Duration::MAX),
+                ] {
+                    assert_error(
+                        &receive_error(code, &[("Retry-After", value)]),
+                        code,
+                        Some(expected),
+                    );
+                }
+            }
+
+            // A saturated reset must dominate a shorter valid delay.
+            for code in [429, 403] {
+                assert_error(
+                    &receive_error(
+                        code,
+                        &[
+                            ("X-RateLimit-Remaining", "0"),
+                            ("Retry-After", "120"),
+                            ("X-RateLimit-Reset", "18446744073709551616"),
+                        ],
+                    ),
+                    code,
+                    Some(Duration::MAX),
+                );
+            }
+
+            // A saturated delay must dominate a shorter valid reset.
+            assert_error(
+                &receive_error(
+                    429,
+                    &[
+                        ("Retry-After", "18446744073709551616"),
+                        ("X-RateLimit-Reset", "253402300799"),
+                    ],
+                ),
+                429,
+                Some(Duration::MAX),
+            );
+        }
+
+        #[test]
+        fn real_malformed_duplicate_and_oversized_headers_keep_policy() {
+            let oversized = "9".repeat(65);
+            for value in [
+                "",
+                "-1",
+                "+120",
+                "1.5",
+                "120 seconds",
+                "120, 240",
+                "Sunday, 06-Nov-94 08:49:37 GMT",
+                "Mon, 06 Nov 1994 08:49:37 GMT",
+                oversized.as_str(),
+            ] {
+                assert_error(
+                    &receive_error(429, &[("Retry-After", value)]),
+                    429,
+                    Some(Duration::from_secs(3600)),
+                );
+                assert_error(&receive_error(403, &[("Retry-After", value)]), 403, None);
+            }
+
+            let duplicate = [("Retry-After", "120"), ("Retry-After", "240")];
+            assert_error(
+                &receive_error(429, &duplicate),
+                429,
+                Some(Duration::from_secs(3600)),
+            );
+            assert_error(&receive_error(403, &duplicate), 403, None);
+
+            // Independent exhaustion evidence survives an unusable delay.
+            assert_error(
+                &receive_error(
+                    403,
+                    &[
+                        ("X-RateLimit-Remaining", "0"),
+                        ("Retry-After", "invalid"),
+                        ("X-RateLimit-Reset", "invalid"),
+                    ],
+                ),
+                403,
+                Some(Duration::from_secs(3600)),
+            );
+
+            // An ambiguous reset cannot override a valid long delay.
+            assert_error(
+                &receive_error(
+                    429,
+                    &[
+                        ("Retry-After", "172800"),
+                        ("X-RateLimit-Reset", "253402300799"),
+                        ("X-RateLimit-Reset", "253402300798"),
+                    ],
+                ),
+                429,
+                Some(Duration::from_secs(172_800)),
+            );
+
+            // Duplicate exhaustion evidence alone does not classify 403.
+            assert_error(
+                &receive_error(
+                    403,
+                    &[
+                        ("X-RateLimit-Remaining", "0"),
+                        ("X-RateLimit-Remaining", "0"),
+                    ],
+                ),
+                403,
+                None,
+            );
+        }
+
+        #[test]
+        fn real_absolute_headers_preserve_later_minimum_beyond_24_hours() {
+            // Fri, 31 Dec 9999 23:59:59 GMT, independently specified as
+            // both an IMF date and Unix seconds. No parser-derived oracle.
+            const TARGET: u64 = 253_402_300_799;
+
+            for (code, headers, relative_minimum) in [
+                (
+                    429,
+                    vec![
+                        ("Retry-After", "120"),
+                        ("X-RateLimit-Reset", "253402300799"),
+                    ],
+                    Duration::from_secs(120),
+                ),
+                (
+                    403,
+                    vec![
+                        ("X-RateLimit-Remaining", "0"),
+                        ("Retry-After", "172800"),
+                        ("X-RateLimit-Reset", "253402300799"),
+                    ],
+                    Duration::from_secs(172_800),
+                ),
+                (
+                    403,
+                    vec![("Retry-After", "Fri, 31 Dec 9999 23:59:59 GMT")],
+                    Duration::ZERO,
+                ),
+                (
+                    429,
+                    vec![
+                        ("Retry-After", "Fri, 31 Dec 9999 23:59:59 GMT"),
+                        ("X-RateLimit-Reset", "4102444800"),
+                    ],
+                    Duration::ZERO,
+                ),
+            ] {
+                // receive samples SystemTime internally. Bracket that sample,
+                // retaining subsecond precision; no sleeps or timing tolerance.
+                let before = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+                let error = receive_error(code, &headers);
+                let after = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+
+                let earliest = before.min(after);
+                let latest = before.max(after);
+                let target = Duration::from_secs(TARGET);
+                let lower = target.saturating_sub(latest).max(relative_minimum);
+                let upper = target.saturating_sub(earliest).max(relative_minimum);
+                assert!(
+                    lower > Duration::from_secs(86_400),
+                    "Fixture requires a wall clock before the distant target",
+                );
+
+                match error {
+                    DownloadError::RateLimited {
+                        code: actual,
+                        retry_after,
+                    } => {
+                        assert_eq!(actual, StatusCode::from_u16(code).unwrap());
+                        assert!(
+                            retry_after >= lower && retry_after <= upper,
+                            "Expected {:?}..={:?}, got {:?}",
+                            lower,
+                            upper,
+                            retry_after,
+                        );
+                    }
+                    other => panic!("Absolute rate metadata lost: {:?}", other),
+                }
+            }
+        }
+
+        // Test-local boxed boundary using a real metadata response and `?`.
+        // This does not invoke github_releases::check or change its URL policy.
+        async fn boxed_metadata(url: &str) -> Result<Vec<u8>, Boxed> {
+            Ok(metadata(url).await?)
+        }
+
+        #[test]
+        fn real_metadata_errors_survive_returned_boxed_boundary() {
+            for (code, headers, expected) in [
+                (429, vec![], Some(Duration::from_secs(3600))),
+                (
+                    403,
+                    vec![("Retry-After", "172800")],
+                    Some(Duration::from_secs(172_800)),
+                ),
+                (
+                    429,
+                    vec![("Retry-After", "18446744073709551616")],
+                    Some(Duration::MAX),
+                ),
+                (403, vec![], None),
+            ] {
+                let url = server(response(code, &headers));
+                let error = async_std::task::block_on(boxed_metadata(&url)).unwrap_err();
+                let typed = error
+                    .downcast_ref::<DownloadError>()
+                    .expect("The returned box lost its concrete DownloadError");
+                assert_error(typed, code, expected);
+            }
+        }
+
+        #[test]
+        fn real_rate_errors_leave_addon_destination_and_existing_files_untouched() {
+            async_std::task::block_on(async {
+                let temp = tempfile::tempdir().unwrap();
+                let sentinel = temp.path().join("keep");
+                let destination = temp.path().join("addon.zip");
+                fs::write(&sentinel, b"existing fixture bytes\n").unwrap();
+
+                for (code, headers, expected) in [
+                    (
+                        429,
+                        vec![("Retry-After", "172800")],
+                        Some(Duration::from_secs(172_800)),
+                    ),
+                    (
+                        403,
+                        vec![("X-RateLimit-Remaining", "0")],
+                        Some(Duration::from_secs(3600)),
+                    ),
+                    (
+                        429,
+                        vec![("X-RateLimit-Reset", "18446744073709551616")],
+                        Some(Duration::MAX),
+                    ),
+                    (403, vec![], None),
+                ] {
+                    let url = server(response(code, &headers));
+                    let error = download_verified(&url, &destination, None, None)
+                        .await
+                        .unwrap_err();
+                    assert_error(&error, code, expected);
+                    assert!(!destination.exists());
+                    assert_eq!(fs::read(&sentinel).unwrap(), b"existing fixture bytes\n");
+                    assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
+                }
+            });
         }
     }
 }
