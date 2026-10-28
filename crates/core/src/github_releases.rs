@@ -480,10 +480,31 @@ mod tests {
             let id = installed.receipt_id.clone();
             drop(installed);
             let root = installation.directory.join("Interface/AddOns");
+            // Modified 2026-10-28: real writer/source/reader compatibility;
+            // original GPLv3 applies.
+            let source = serde_json::to_value(&first).unwrap();
+            assert_eq!(source["repository"], "fixture/addon");
+            assert_eq!(source["product"], "Retail");
             assert_eq!(
-                crate::fs::inspect_ownership(&root, &id).unwrap().folders,
-                ["Foo"]
+                source["product"],
+                serde_json::to_value(installation.product).unwrap()
             );
+            assert_eq!(installation.product, Product::Retail);
+
+            let receipt_path = root.join(".patchloom-ownership").join(format!("{id}.json"));
+            let receipt_bytes = fs::read(&receipt_path).unwrap();
+            let record: serde_json::Value = serde_json::from_slice(&receipt_bytes).unwrap();
+            assert_eq!(record["format"], 1);
+            assert_eq!(record["source"], source);
+            assert_eq!(record["source"]["repository"], "fixture/addon");
+            assert_eq!(record["source"]["product"], "Retail");
+
+            let preview = crate::fs::inspect_ownership(&root, &id).unwrap();
+            assert_eq!(preview.id, id);
+            assert_eq!(preview.root, root.canonicalize().unwrap());
+            assert_eq!(preview.source, source);
+            assert_eq!(preview.folders, ["Foo"]);
+            assert_eq!(fs::read(&receipt_path).unwrap(), receipt_bytes);
             let bytes = zip(&[
                 ("Foo/Foo.toc", "## Interface: 120105\n## Version: v3\n"),
                 ("Foo/new.lua", "v3"),
@@ -619,5 +640,118 @@ mod tests {
             assert!(!archive.is_empty());
             println!("Verified public release {}: {} bytes, SHA-256 matched; ZIP only read, never installed/executed",selected.version,selected.size);
         });
+    }
+
+    // CORE: append inside the existing #[cfg(test)] mod tests containing
+    // fixture(), zip(), candidate(), and server(). No existing code changes.
+    // Added 2026-10-28; original GPLv3 applies.
+
+    #[test]
+    #[ignore = "explicit paired core/app unit-test harness; disposable fixtures only"]
+    fn real_writer_receipt_reaches_gui_completion_parent() {
+        use std::{
+            path::PathBuf,
+            process::Command as ProcessCommand,
+            time::{Duration, Instant},
+        };
+
+        // Explicitly supplied app UNIT-TEST executable, not the application binary.
+        // Never search target/ or accept an existing receipt as input.
+        let gui_test = PathBuf::from(
+            std::env::var_os("PATCHLOOM_GUI_BRIDGE_TEST_EXE")
+                .expect("Supply the matching app unit-test executable explicitly"),
+        );
+        assert!(gui_test.is_absolute(), "Use an absolute executable path");
+        assert!(gui_test.is_file(), "App unit-test executable is missing");
+
+        let (temp, installation, previous) = fixture();
+        let root = installation.directory.parent().unwrap().to_path_buf();
+        let addons = installation.directory.join("Interface/AddOns");
+        let ack = temp.path().join("gui-bridge-complete");
+        assert_eq!(
+            root.parent().unwrap().canonicalize().unwrap(),
+            temp.path().canonicalize().unwrap()
+        );
+        assert!(!ack.exists());
+
+        let bytes = zip(&[
+            ("Foo/Foo.toc", "## Interface: 120105\n## Version: v2\n"),
+            ("Foo/new.lua", "v2"),
+        ]);
+        let mut selected = candidate(&installation, &bytes);
+        selected.url = server(bytes);
+
+        let installed =
+            async_std::task::block_on(selected.install(&installation, &previous, temp.path()))
+                .unwrap();
+        assert_eq!(installed.folders.len(), 1);
+        assert_eq!(installed.folders[0].version.as_deref(), Some("v2"));
+
+        // Forward the ID returned by the real installer, never a manufactured ID
+        // or a serialized OwnershipPreview.
+        let id = installed.receipt_id.clone();
+        let source = serde_json::to_value(&selected).unwrap();
+        assert_eq!(source["repository"], "fixture/addon");
+        assert_eq!(source["product"], "Retail");
+        let receipt_path = addons
+            .join(".patchloom-ownership")
+            .join(format!("{id}.json"));
+        let receipt_before = fs::read(&receipt_path).unwrap();
+        let record: serde_json::Value = serde_json::from_slice(&receipt_before).unwrap();
+        assert_eq!(record["format"], 1);
+        assert_eq!(record["source"], source);
+
+        let toc_before = fs::read(addons.join("Foo/Foo.toc")).unwrap();
+        let lua_before = fs::read(addons.join("Foo/new.lua")).unwrap();
+        assert_eq!(lua_before, b"v2");
+        assert!(!addons.join("Foo/old.lua").exists());
+
+        // The parent retains TempDir ownership until the app test finishes.
+        // The child receives fixture location and expectations, not receipt bytes.
+        let mut child = ProcessCommand::new(&gui_test)
+            .arg("real_writer_receipt_reaches_gui_completion_child")
+            .arg("--ignored")
+            .arg("--test-threads=1")
+            .env("APPDATA", temp.path().join("isolated-appdata"))
+            .env("LOCALAPPDATA", temp.path().join("isolated-appdata"))
+            .env("XDG_CONFIG_HOME", temp.path().join("isolated-appdata"))
+            .env("HOME", temp.path().join("isolated-appdata"))
+            .env("PATCHLOOM_GUI_BRIDGE_ROOT", &root)
+            .env("PATCHLOOM_GUI_BRIDGE_ID", &id)
+            .env("PATCHLOOM_GUI_BRIDGE_SOURCE", source.to_string())
+            .spawn()
+            .expect("Could not start the supplied app unit-test executable");
+
+        // ponytail: fixed test-only ceiling; revisit only for measured runner needs.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                outcome => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!(
+                        "GUI bridge child timed out or could not be waited: {:?}",
+                        outcome
+                    );
+                }
+            }
+        };
+        assert!(status.success(), "GUI bridge child failed: {}", status);
+
+        // A libtest filter matching zero tests also exits successfully. Require a
+        // fresh acknowledgement written only after the child's GUI assertions.
+        assert_eq!(
+            fs::read(&ack).expect("GUI child did not complete its assertions"),
+            b"writer-receipt/gui-completion/v1\n",
+        );
+
+        assert_eq!(fs::read(&receipt_path).unwrap(), receipt_before);
+        assert_eq!(fs::read(addons.join("Foo/Foo.toc")).unwrap(), toc_before);
+        assert_eq!(fs::read(addons.join("Foo/new.lua")).unwrap(), lua_before);
+        assert!(!addons.join("Foo/old.lua").exists());
     }
 }

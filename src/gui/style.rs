@@ -1,3 +1,4 @@
+// Patchloom lint maintenance, 2026-10-27; original license and attribution apply.
 use ajour_core::theme::ColorPalette;
 use ajour_widgets::table_row;
 use iced::{
@@ -170,49 +171,11 @@ impl container::StyleSheet for NormalErrorForegroundContainer {
     }
 }
 
-pub struct BrightTextButton(pub ColorPalette);
-impl button::StyleSheet for BrightTextButton {
-    fn active(&self) -> button::Style {
-        button::Style {
-            text_color: self.0.bright.surface,
-            border_radius: 2.0,
-            ..button::Style::default()
-        }
-    }
-
-    fn hovered(&self) -> button::Style {
-        button::Style {
-            background: Some(Background::Color(Color::TRANSPARENT)),
-            text_color: self.0.bright.primary,
-            ..self.active()
-        }
-    }
-}
-
 pub struct NormalTextButton(pub ColorPalette);
 impl button::StyleSheet for NormalTextButton {
     fn active(&self) -> button::Style {
         button::Style {
             text_color: self.0.normal.surface,
-            border_radius: 2.0,
-            ..button::Style::default()
-        }
-    }
-
-    fn hovered(&self) -> button::Style {
-        button::Style {
-            background: Some(Background::Color(Color::TRANSPARENT)),
-            text_color: self.0.bright.primary,
-            ..self.active()
-        }
-    }
-}
-
-pub struct SelectedBrightTextButton(pub ColorPalette);
-impl button::StyleSheet for SelectedBrightTextButton {
-    fn active(&self) -> button::Style {
-        button::Style {
-            text_color: self.0.bright.primary,
             border_radius: 2.0,
             ..button::Style::default()
         }
@@ -294,43 +257,6 @@ impl button::StyleSheet for DefaultBoxedButton {
             text_color: Color {
                 a: 0.50,
                 ..self.0.bright.primary
-            },
-            ..self.active()
-        }
-    }
-}
-
-pub struct SecondaryBoxedButton(pub ColorPalette);
-impl button::StyleSheet for SecondaryBoxedButton {
-    fn active(&self) -> button::Style {
-        button::Style {
-            background: Some(Background::Color(Color {
-                a: 0.15,
-                ..self.0.normal.secondary
-            })),
-            text_color: self.0.bright.secondary,
-            border_radius: 2.0,
-            ..button::Style::default()
-        }
-    }
-
-    fn hovered(&self) -> button::Style {
-        button::Style {
-            background: Some(Background::Color(self.0.normal.secondary)),
-            text_color: self.0.bright.secondary,
-            ..self.active()
-        }
-    }
-
-    fn disabled(&self) -> button::Style {
-        button::Style {
-            background: Some(Background::Color(Color {
-                a: 0.05,
-                ..self.0.normal.secondary
-            })),
-            text_color: Color {
-                a: 0.15,
-                ..self.0.bright.secondary
             },
             ..self.active()
         }
@@ -495,16 +421,6 @@ impl button::StyleSheet for SelectedDefaultButton {
     }
 }
 
-pub struct Row(pub ColorPalette);
-impl container::StyleSheet for Row {
-    fn style(&self) -> container::Style {
-        container::Style {
-            background: Some(Background::Color(self.0.base.background)),
-            ..container::Style::default()
-        }
-    }
-}
-
 pub struct TableRow(pub ColorPalette);
 impl table_row::StyleSheet for TableRow {
     fn style(&self) -> table_row::Style {
@@ -595,41 +511,6 @@ impl table_row::StyleSheet for TableRowAlternate {
                 ..self.0.normal.primary
             })),
             ..style
-        }
-    }
-}
-
-pub struct ForegroundScrollable(pub ColorPalette);
-impl scrollable::StyleSheet for ForegroundScrollable {
-    fn active(&self) -> scrollable::Scrollbar {
-        scrollable::Scrollbar {
-            background: Some(Background::Color(self.0.base.foreground)),
-            border_radius: 0.0,
-            border_width: 0.0,
-            border_color: Color::TRANSPARENT,
-            scroller: scrollable::Scroller {
-                color: self.0.base.background,
-                border_radius: 2.0,
-                border_width: 0.0,
-                border_color: Color::TRANSPARENT,
-            },
-        }
-    }
-
-    fn hovered(&self) -> scrollable::Scrollbar {
-        let active = self.active();
-
-        scrollable::Scrollbar {
-            scroller: scrollable::Scroller { ..active.scroller },
-            ..active
-        }
-    }
-
-    fn dragging(&self) -> scrollable::Scrollbar {
-        let hovered = self.hovered();
-        scrollable::Scrollbar {
-            scroller: scrollable::Scroller { ..hovered.scroller },
-            ..hovered
         }
     }
 }

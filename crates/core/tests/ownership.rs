@@ -1,4 +1,4 @@
-//! Config-free ownership inspection fixtures; original GPLv3 applies.
+//! Config-free ownership inspection fixtures, 2026-10-27; original GPLv3 applies.
 use sha2::{Digest, Sha256};
 use std::{fs, path::Path, process::Command};
 fn snapshot(root: &Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
@@ -50,9 +50,49 @@ fn inspect_command_is_read_only_and_rejects_changed_content() {
     assert_eq!(preview["folders"][0].as_str(), Some("Foo"));
     assert_eq!(snapshot(temp.path()), before);
     assert!(!config.exists());
+    for invalid in ["".to_owned(), "../receipt".into(), "A".repeat(64)] {
+        assert!(ajour_core::fs::inspect_ownership(&root, &invalid).is_err());
+    }
+    assert_eq!(snapshot(temp.path()), before);
+    let store = root.join(".patchloom-ownership");
+    let malformed = b"{";
+    let malformed_id = format!("{:x}", Sha256::digest(malformed));
+    fs::write(store.join(format!("{malformed_id}.json")), malformed).unwrap();
+    let before = snapshot(temp.path());
+    assert!(ajour_core::fs::inspect_ownership(&root, &malformed_id).is_err());
+    assert_eq!(snapshot(temp.path()), before);
+    let other_root = temp.path().join("other-AddOns");
+    fs::create_dir_all(other_root.join(".patchloom-ownership")).unwrap();
+    fs::copy(
+        store.join(format!("{id}.json")),
+        other_root
+            .join(".patchloom-ownership")
+            .join(format!("{id}.json")),
+    )
+    .unwrap();
+    let before = snapshot(temp.path());
+    let mismatch = ajour_core::fs::inspect_ownership(&other_root, &id).unwrap_err();
+    assert!(mismatch.to_string().contains("installation mismatch"));
+    assert_eq!(snapshot(temp.path()), before);
+    let original = fs::read(store.join(format!("{id}.json"))).unwrap();
+    let changed_id = if id == "0".repeat(64) {
+        "f".repeat(64)
+    } else {
+        "0".repeat(64)
+    };
+    fs::write(store.join(format!("{changed_id}.json")), original).unwrap();
+    let before = snapshot(temp.path());
+    let mismatch = ajour_core::fs::inspect_ownership(&root, &changed_id).unwrap_err();
+    assert!(mismatch.to_string().contains("checksum mismatch"));
+    assert_eq!(snapshot(temp.path()), before);
     fs::write(root.join("Foo/a.lua"), b"user-change").unwrap();
     let before = snapshot(temp.path());
     assert!(!run().status.success());
+    assert_eq!(snapshot(temp.path()), before);
+    assert!(!config.exists());
+    fs::write(root.join("Foo/a.lua"), b"fixture").unwrap();
+    let before = snapshot(temp.path());
+    assert!(run().status.success());
     assert_eq!(snapshot(temp.path()), before);
     assert!(!config.exists());
 }

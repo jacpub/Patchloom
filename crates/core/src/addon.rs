@@ -1,3 +1,4 @@
+// Patchloom lint maintenance, 2026-10-27; original license and attribution apply.
 //! Patchloom metadata lookups, modified 2026-10-27; original Ajour GPLv3 applies.
 use crate::{
     error::{ParseError, RepositoryError},
@@ -59,7 +60,7 @@ impl Eq for AddonFolder {}
 
 impl PartialOrd for AddonFolder {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.id.cmp(&other.id))
+        Some(self.cmp(other))
     }
 }
 
@@ -240,7 +241,7 @@ impl Addon {
                 folder.id.clone()
             } else {
                 // Wont fail since we already checked if vec is empty
-                folders.get(0).map(|f| f.id.clone()).unwrap()
+                folders.first().map(|f| f.id.clone()).unwrap()
             };
             self.primary_folder_id = primary_folder_id;
             self.folders = folders;
@@ -565,7 +566,7 @@ impl PartialEq for Addon {
 
 impl PartialOrd for Addon {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.title().cmp(other.title()))
+        Some(self.cmp(other))
     }
 }
 

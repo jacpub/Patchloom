@@ -1,3 +1,4 @@
+// Patchloom lint maintenance, 2026-10-27; original license and attribution apply.
 use ajour_core::network::request_async;
 use async_std::fs;
 use async_std::path::Path;
@@ -82,7 +83,7 @@ async fn parse_weak_auras(
     let lua_path = wtf_path
         .as_ref()
         .join("Account")
-        .join(&account)
+        .join(account)
         .join("SavedVariables")
         .join("WeakAuras.lua");
 
@@ -163,7 +164,7 @@ async fn parse_platers(
     let lua_path = wtf_path
         .as_ref()
         .join("Account")
-        .join(&account)
+        .join(account)
         .join("SavedVariables")
         .join("Plater.lua");
 
@@ -183,23 +184,21 @@ async fn parse_platers(
         let maybe_table = table.get::<_, Option<HashMap<String, LuaTable>>>("profiles")?;
 
         let hooks = maybe_table.as_ref().map(|t| {
-            t.iter()
-                .map(|(_, t)| {
+            t.values()
+                .flat_map(|t| {
                     t.get::<_, Vec<MaybeAuraDisplay>>("hook_data")
                         .ok()
                         .unwrap_or_default()
                 })
-                .flatten()
                 .collect::<Vec<_>>()
         });
         let scripts = maybe_table.as_ref().map(|t| {
-            t.iter()
-                .map(|(_, t)| {
+            t.values()
+                .flat_map(|t| {
                     t.get::<_, Vec<MaybeAuraDisplay>>("script_data")
                         .ok()
                         .unwrap_or_default()
                 })
-                .flatten()
                 .collect::<Vec<_>>()
         });
         let profiles = table.get::<_, Option<HashMap<String, MaybeAuraDisplay>>>("profiles")?;
@@ -394,17 +393,12 @@ impl Debug for AuraUpdate {
 }
 
 /// Status used by GUI to track state of the Aura
-#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Eq, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Eq, Ord, Default)]
 pub enum AuraStatus {
+    #[default]
     Idle,
     UpdateQueued,
     UpdateAvailable,
-}
-
-impl Default for AuraStatus {
-    fn default() -> Self {
-        AuraStatus::Idle
-    }
 }
 
 impl Display for AuraStatus {
@@ -419,16 +413,11 @@ impl Display for AuraStatus {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum AuraKind {
+    #[default]
     WeakAura,
     Plater,
-}
-
-impl Default for AuraKind {
-    fn default() -> Self {
-        AuraKind::WeakAura
-    }
 }
 
 /// A parsed Aura from SavedVariables along with it's Wago.io metadata
@@ -496,8 +485,7 @@ impl Aura {
 
     pub fn installed_symver(&self) -> Option<&str> {
         self.parent_display()
-            .map(|d| d.version_string.as_deref())
-            .flatten()
+            .and_then(|d| d.version_string.as_deref())
     }
 
     pub fn remote_symver(&self) -> &str {
@@ -539,7 +527,7 @@ impl Aura {
     }
 
     fn ignored_version(&self) -> Option<u16> {
-        self.parent_display().map(|d| d.skip_version).flatten()
+        self.parent_display().and_then(|d| d.skip_version)
     }
 
     pub fn has_update(&self) -> bool {
@@ -560,7 +548,8 @@ impl Aura {
 #[derive(Debug, Deserialize, Clone)]
 struct AuraChangelog {
     text: Option<String>,
-    format: Option<String>,
+    #[serde(rename = "format")]
+    _format: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

@@ -1,3 +1,4 @@
+// Patchloom lint maintenance, 2026-10-27; original license and attribution apply.
 // Avoid spawning an console window for the program.
 // This is ignored on other platforms.
 // https://msdn.microsoft.com/en-us/library/4cc7ya5b.aspx for more information.
@@ -205,7 +206,7 @@ fn handle_self_update_temp(cleanup_path: &Path) -> Result<()> {
 
         let parent_dir = current_bin.parent().unwrap();
 
-        let main_bin = parent_dir.join(&main_bin_name);
+        let main_bin = parent_dir.join(main_bin_name);
 
         rename(&current_bin, &main_bin)?;
     } else {

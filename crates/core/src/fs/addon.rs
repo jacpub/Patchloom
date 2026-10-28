@@ -1,3 +1,4 @@
+// Patchloom lint maintenance, 2026-10-27; original license and attribution apply.
 use super::Result;
 use crate::addon::AddonFolder;
 use std::fs::{remove_dir_all, remove_file};
@@ -18,7 +19,7 @@ pub fn delete_addons(addon_folders: &[AddonFolder]) -> Result<()> {
 
 /// Deletes all saved varaible files correlating to `[AddonFolder]`.
 pub fn delete_saved_variables(addon_folders: &[AddonFolder], wtf_path: &Path) -> Result<()> {
-    for entry in WalkDir::new(&wtf_path)
+    for entry in WalkDir::new(wtf_path)
         .into_iter()
         .filter_map(std::result::Result::ok)
     {
@@ -98,14 +99,14 @@ mod test {
         let mut files = vec![];
         for (idx, folder) in folders.iter().enumerate() {
             let mut name = if idx % 2 == 0 {
-                format!("{}.lua", &folder.id)
+                format!("{}.lua", folder.id)
             } else {
-                format!("{}.lua.bak", &folder.id)
+                format!("{}.lua.bak", folder.id)
             };
 
             // change filename of last file, it shouldn't get removed
             if idx == folders.len() - 1 {
-                name = format!("{}.nonlua", &folder.id)
+                name = format!("{}.nonlua", folder.id)
             }
 
             let path = sv.join(&name);

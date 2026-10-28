@@ -75,6 +75,9 @@ fn preview_binary_bypasses_legacy_startup_and_never_changes_fixture_or_config() 
         Some("Retail")
     );
     assert!(model["selected"].is_null());
+    let repeated = run(&[]);
+    assert!(repeated.status.success(), "{:?}", repeated);
+    assert_eq!(repeated.stdout, output.stdout);
     assert_eq!(snapshot(temp.path()), before);
     assert!(!config.exists());
     fs::write(
@@ -119,4 +122,14 @@ fn preview_binary_bypasses_legacy_startup_and_never_changes_fixture_or_config() 
     assert!(!run(&["--preview-window-check"]).status.success());
     assert_eq!(snapshot(temp.path()), before);
     assert!(!config.exists());
+    fs::create_dir(&config).unwrap();
+    fs::write(config.join("existing-config"), b"preserve config bytes").unwrap();
+    let before = snapshot(temp.path());
+    let first = run(&[]);
+    let second = run(&[]);
+    assert!(!first.status.success());
+    assert!(!second.status.success());
+    assert_eq!(first.stdout, second.stdout);
+    assert!(serde_json::from_slice::<serde_json::Value>(&first.stdout).is_ok());
+    assert_eq!(snapshot(temp.path()), before);
 }
