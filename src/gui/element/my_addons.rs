@@ -1,3 +1,4 @@
+// Patchloom lint maintenance, 2026-10-27; original license and attribution apply.
 use crate::gui::Confirm;
 
 use {
@@ -104,13 +105,13 @@ pub fn titles_row_header<'a>(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn data_row_container<'a, 'b>(
+pub fn data_row_container<'a>(
     color_palette: ColorPalette,
     addon: &'a mut Addon,
     is_addon_expanded: bool,
     expand_type: &'a ExpandType,
     config: &Config,
-    column_config: &'b [(ColumnKey, Length, bool)],
+    column_config: &[(ColumnKey, Length, bool)],
     is_odd: Option<bool>,
     pending_confirmation: &Option<Confirm>,
 ) -> TableRow<'a, Message> {
@@ -515,7 +516,7 @@ pub fn data_row_container<'a, 'b>(
     let mut row = Row::new().push(left_spacer).spacing(1);
 
     // Sort columns and push them into row
-    row_containers.sort_by(|a, b| a.0.cmp(&b.0));
+    row_containers.sort_by_key(|a| a.0);
     for (_, elem) in row_containers.into_iter() {
         row = row.push(elem);
     }

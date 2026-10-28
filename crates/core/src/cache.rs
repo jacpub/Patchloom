@@ -1,3 +1,4 @@
+// Patchloom lint maintenance, 2026-10-27; original license and attribution apply.
 use crate::error::{CacheError, FilesystemError};
 use crate::fs::{config_dir, PersistentData};
 use crate::parse::Fingerprint;
@@ -302,7 +303,7 @@ mod test {
                     notes: Default::default(),
                     version: Default::default(),
                     repository_identifiers: RepositoryIdentifiers {
-                        curse: Some(idx as i32),
+                        curse: Some(idx),
                         ..Default::default()
                     },
                     dependencies: Default::default(),

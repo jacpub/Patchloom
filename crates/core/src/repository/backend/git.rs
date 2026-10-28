@@ -1,3 +1,4 @@
+// Patchloom lint maintenance, 2026-10-27; original license and attribution apply.
 use crate::config::Flavor;
 use crate::error::{DownloadError, RepositoryError};
 use crate::repository::RepositoryPackage;
@@ -12,13 +13,15 @@ pub use gitlab::Gitlab;
 #[derive(Debug, Clone, Deserialize)]
 pub struct ReleaseFileMetadata {
     flavor: Flavor,
-    interface: i32,
+    #[serde(rename = "interface")]
+    _interface: i32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ReleaseFilePackage {
     filename: String,
-    nolib: bool,
+    #[serde(rename = "nolib")]
+    _nolib: bool,
     metadata: Vec<ReleaseFileMetadata>,
 }
 
@@ -165,8 +168,7 @@ mod github {
                 let release = stable_release.or(beta_release);
 
                 let html_url = release
-                    .map(|r| r.html_url.parse::<Uri>().ok())
-                    .flatten()
+                    .and_then(|r| r.html_url.parse::<Uri>().ok())
                     .unwrap_or_default();
 
                 let mut path = html_url.path().split('/');
@@ -445,12 +447,14 @@ mod gitlab {
             let encoded = urlencoding::encode(path);
 
             // Get last path part as repo name
-            let path_parts = path.split('/');
-            let repo = path_parts.last().ok_or(RepositoryError::GitMissingRepo {
-                url: self.url.to_string(),
-            })?;
+            let mut path_parts = path.split('/');
+            let repo = path_parts
+                .next_back()
+                .ok_or(RepositoryError::GitMissingRepo {
+                    url: self.url.to_string(),
+                })?;
 
-            let url = format!("https://gitlab.com/api/v4/projects/{}/releases", &encoded);
+            let url = format!("https://gitlab.com/api/v4/projects/{}/releases", encoded);
 
             let mut resp = request_async(&url, vec![], None).await?;
 
@@ -459,7 +463,7 @@ mod gitlab {
                 .await
                 .map_err(|_| RepositoryError::GitMissingRelease { url: url.clone() })?;
             let release = releases
-                .get(0)
+                .first()
                 .ok_or(RepositoryError::GitMissingRelease { url: url.clone() })?;
 
             let version = release.tag_name.clone();
@@ -537,13 +541,16 @@ mod gitlab {
         pub description: String,
         pub released_at: DateTime<Utc>,
         pub assets: ReleaseAssets,
-        pub upcoming_release: bool,
-        pub tag_path: String,
+        #[serde(rename = "upcoming_release")]
+        pub _upcoming_release: bool,
+        #[serde(rename = "tag_path")]
+        pub _tag_path: String,
     }
 
     #[derive(Debug, Deserialize, Clone)]
     pub struct ReleaseAssets {
-        pub count: u8,
+        #[serde(rename = "count")]
+        pub _count: u8,
         pub links: Vec<ReleaseLink>,
     }
 

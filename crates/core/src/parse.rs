@@ -1,3 +1,4 @@
+// Patchloom lint maintenance, 2026-10-27; original license and attribution apply.
 use crate::{
     addon::{Addon, AddonFolder, AddonState},
     cache::{self, AddonCache, AddonCacheEntry, ExternalReleaseId, FingerprintCache},
@@ -244,13 +245,11 @@ async fn fingerprint_all_dirs(
         );
     }
 
-    // Update our in memory collection. We must then drop it to get a reference
-    // to our fingerprint cache as this currently holds a mutable reference.
+    // Update the collection; its mutable borrow ends before persisting the cache.
     if let Some(fingerprints) = fingerprints.as_mut() {
         fingerprints.drain(..);
         fingerprints.extend(new_fingerprints.clone());
     }
-    drop(fingerprints);
 
     // Persist cache changes to disk
     if let Some(fingerprint_cache) = fingerprint_cache.as_ref() {
@@ -285,7 +284,7 @@ async fn parse_addon_folders(
                     for part in multi_part {
                         for separator in &["-", "_"] {
                             let toc_with_flavor = root_dir
-                                .join(&id)
+                                .join(id)
                                 .join(format!("{}{}{}.toc", id, separator, part));
                             if toc_with_flavor.exists() {
                                 return Some(toc_with_flavor);
@@ -296,7 +295,7 @@ async fn parse_addon_folders(
                     None
                 };
 
-                toc_with_flavor().unwrap_or_else(|| root_dir.join(&id).join(format!("{}.toc", id)))
+                toc_with_flavor().unwrap_or_else(|| root_dir.join(id).join(format!("{}.toc", id)))
             };
 
             if !toc_path.exists() {
@@ -308,8 +307,7 @@ async fn parse_addon_folders(
             addon_folder.fingerprint = fingerprints
                 .iter()
                 .find(|f| &f.title == id)
-                .map(|f| f.hash)
-                .flatten();
+                .and_then(|f| f.hash);
 
             Some(addon_folder)
         })
@@ -383,8 +381,7 @@ async fn get_curse_fingerprint_info(
         .filter(|folder| {
             !cache_entries
                 .iter()
-                .map(|e| &e.folder_names)
-                .flatten()
+                .flat_map(|e| &e.folder_names)
                 .any(|name| name == &folder.id)
         })
         .filter_map(|folder| folder.fingerprint)
@@ -461,11 +458,7 @@ async fn get_all_repo_packages(
     let mut hub_ids = vec![];
     let mut git_urls = vec![];
 
-    let cached_folder_names: Vec<_> = cache_entries
-        .iter()
-        .map(|e| &e.folder_names)
-        .flatten()
-        .collect();
+    let cached_folder_names: Vec<_> = cache_entries.iter().flat_map(|e| &e.folder_names).collect();
 
     // Get all possible curse ids
     {
@@ -1086,7 +1079,9 @@ pub fn parse_toc_path(toc_path: &Path) -> Option<AddonFolder> {
     let mut tukui_id: Option<String> = None;
     let mut curse_id: Option<i32> = None;
 
-    for line in reader.lines().filter_map(|l| l.ok()) {
+    for line in reader.lines() {
+        // Incomplete metadata must not identify an addon after a read/UTF-8 error.
+        let line = line.ok()?;
         for cap in RE_TOC_LINE.captures_iter(line.as_str()) {
             match &cap["key"] {
                 // Note: Coloring is possible via UI escape sequences.
@@ -1162,6 +1157,13 @@ fn split_dependencies_into_vec(value: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unreadable_toc_line_rejects_partial_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let toc = temp.path().join("Fixture.toc");
+        std::fs::write(&toc, b"## Title: Partial\n\xff\n## Version: 1\n").unwrap();
+        assert!(super::parse_toc_path(&toc).is_none());
+    }
     use super::*;
 
     #[test]

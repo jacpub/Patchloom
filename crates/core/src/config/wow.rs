@@ -1,3 +1,4 @@
+// Patchloom lint maintenance, 2026-10-27; original license and attribution apply.
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -27,9 +28,12 @@ impl Default for Wow {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Hash, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Hash, PartialOrd, Ord, Default,
+)]
 pub enum Flavor {
     #[serde(alias = "retail", alias = "mainline", alias = "wow_retail")]
+    #[default]
     Retail,
     #[serde(alias = "RetailPTR")]
     RetailPtr,
@@ -110,12 +114,6 @@ impl Flavor {
             Flavor::ClassicPtr => "_classic_ptr_".to_owned(),
             Flavor::ClassicBeta => "_classic_beta_".to_owned(),
         }
-    }
-}
-
-impl Default for Flavor {
-    fn default() -> Flavor {
-        Flavor::Retail
     }
 }
 

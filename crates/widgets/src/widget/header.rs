@@ -223,29 +223,27 @@ where
                         return event::Status::Captured;
                     }
                 }
-                Event::Mouse(mouse::Event::CursorMoved { position }) => {
-                    if self.state.resizing {
-                        let delta = position.x - self.state.starting_cursor_pos.unwrap().x;
+                Event::Mouse(mouse::Event::CursorMoved { position }) if self.state.resizing => {
+                    let delta = position.x - self.state.starting_cursor_pos.unwrap().x;
 
-                        let left_width = self.state.starting_left_width;
-                        let right_width = self.state.starting_right_width;
+                    let left_width = self.state.starting_left_width;
+                    let right_width = self.state.starting_right_width;
 
-                        let max_width = left_width + right_width - 30.0;
+                    let max_width = left_width + right_width - 30.0;
 
-                        let left_width = (left_width + delta).max(30.0).min(max_width) as u16;
-                        let left_name = &self.names[self.state.resizing_idx - start_offset];
-                        let right_width = (right_width - delta).max(30.0).min(max_width) as u16;
-                        let right_name = &self.names[self.state.resizing_idx + 1 - start_offset];
+                    let left_width = (left_width + delta).max(30.0).min(max_width) as u16;
+                    let left_name = &self.names[self.state.resizing_idx - start_offset];
+                    let right_width = (right_width - delta).max(30.0).min(max_width) as u16;
+                    let right_name = &self.names[self.state.resizing_idx + 1 - start_offset];
 
-                        self.trigger_resize(
-                            left_name.clone(),
-                            left_width,
-                            right_name.clone(),
-                            right_width,
-                            messages,
-                        );
-                        return event::Status::Captured;
-                    }
+                    self.trigger_resize(
+                        left_name.clone(),
+                        left_width,
+                        right_name.clone(),
+                        right_width,
+                        messages,
+                    );
+                    return event::Status::Captured;
                 }
                 _ => {}
             }

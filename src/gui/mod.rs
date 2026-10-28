@@ -1,3 +1,4 @@
+// Patchloom lint maintenance, 2026-10-27; original license and attribution apply.
 mod element;
 mod style;
 mod update;
@@ -37,23 +38,18 @@ use isahc::http::Uri;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::RwLock;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use strfmt::strfmt;
 
 use element::{DEFAULT_FONT_SIZE, DEFAULT_PADDING};
 static WINDOW_ICON: &[u8] = include_bytes!("../../resources/windows/ajour.ico");
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub enum State {
+    #[default]
     Ready,
     Loading,
     Error(anyhow::Error),
-}
-
-impl Default for State {
-    fn default() -> Self {
-        State::Ready
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -216,15 +212,15 @@ pub enum Message {
     AjourUpdateDownloaded(Result<(PathBuf, PathBuf), DownloadError>),
     AddonCacheUpdated(Result<AddonCacheEntry, CacheError>),
     AddonCacheEntryRemoved(Result<Option<AddonCacheEntry>, CacheError>),
-    RefreshCatalog(Instant),
-    CheckLatestRelease(Instant),
+    RefreshCatalog,
+    CheckLatestRelease,
     CheckWeakAurasInstalled((Flavor, bool)),
     ListWtfAccounts((Flavor, Result<Vec<String>, ajour_weak_auras::Error>)),
     WeakAurasAccountSelected(String),
     ParsedAuras((Flavor, Result<Vec<Aura>, ajour_weak_auras::Error>)),
     AurasUpdated((Flavor, Result<Vec<String>, ajour_weak_auras::Error>)),
     FetchedChangelog((Addon, Result<Changelog, RepositoryError>)),
-    CheckRepositoryUpdates(Instant),
+    CheckRepositoryUpdates,
     RepositoryPackagesFetched((Flavor, Result<Vec<RepositoryPackage>, DownloadError>)),
     ThemeImported(Result<(String, Vec<Theme>), ThemeError>),
     ExportAddons(Option<PathBuf>),
@@ -415,11 +411,11 @@ impl Application for Ajour {
     fn subscription(&self) -> Subscription<Self::Message> {
         let runtime_subscription = iced_native::subscription::events().map(Message::RuntimeEvent);
         let catalog_subscription =
-            iced_futures::time::every(Duration::from_secs(60 * 5)).map(Message::RefreshCatalog);
+            iced_futures::time::every(Duration::from_secs(60 * 5)).map(|_| Message::RefreshCatalog);
         let new_release_subscription = iced_futures::time::every(Duration::from_secs(60 * 60))
-            .map(Message::CheckLatestRelease);
+            .map(|_| Message::CheckLatestRelease);
         let check_updates_subscription = iced_futures::time::every(Duration::from_secs(60 * 30))
-            .map(Message::CheckRepositoryUpdates);
+            .map(|_| Message::CheckRepositoryUpdates);
 
         iced::Subscription::batch(vec![
             runtime_subscription,
@@ -436,7 +432,7 @@ impl Application for Ajour {
         }
     }
 
-    fn view(&mut self) -> Element<Message> {
+    fn view(&mut self) -> Element<'_, Message> {
         // Get color palette of chosen theme.
         let color_palette = self
             .theme_state
@@ -769,7 +765,7 @@ impl Application for Ajour {
                 )
                 .style(style::DefaultBoxedButton(color_palette));
 
-                if matches!(install_status, None) && !installed && is_valid_url {
+                if install_status.is_none() && !installed && is_valid_url {
                     install_button = install_button.on_press(Interaction::InstallScmUrl);
                 }
 
@@ -1277,34 +1273,17 @@ pub fn run(opts: Opts, config: Config) {
     Ajour::run(settings).expect("running Ajour gui");
 }
 
+#[derive(Default)]
 pub struct InstallFromScmState {
     pub query: Option<String>,
     pub query_state: text_input::State,
     pub install_button_state: button::State,
 }
 
-impl Default for InstallFromScmState {
-    fn default() -> Self {
-        InstallFromScmState {
-            query: None,
-            query_state: Default::default(),
-            install_button_state: Default::default(),
-        }
-    }
-}
-
+#[derive(Default)]
 pub struct WowDirectoryState {
     pub flavor: Flavor,
     pub button_state: button::State,
-}
-
-impl Default for WowDirectoryState {
-    fn default() -> Self {
-        WowDirectoryState {
-            flavor: Default::default(),
-            button_state: Default::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -1406,18 +1385,10 @@ impl SortDirection {
     }
 }
 
+#[derive(Default)]
 pub struct AddonsSearchState {
     pub query: Option<String>,
     pub query_state: text_input::State,
-}
-
-impl Default for AddonsSearchState {
-    fn default() -> Self {
-        AddonsSearchState {
-            query: Default::default(),
-            query_state: Default::default(),
-        }
-    }
 }
 
 pub struct HeaderState {
@@ -1544,14 +1515,12 @@ impl From<&ColumnState> for ColumnConfigV2 {
 }
 
 pub struct ColumnSettings {
-    pub scrollable_state: scrollable::State,
     pub columns: Vec<ColumnSettingState>,
 }
 
 impl Default for ColumnSettings {
     fn default() -> Self {
         ColumnSettings {
-            scrollable_state: Default::default(),
             columns: vec![
                 ColumnSettingState {
                     key: ColumnKey::Title,
@@ -1797,14 +1766,12 @@ impl From<&CatalogColumnState> for ColumnConfigV2 {
 }
 
 pub struct CatalogColumnSettings {
-    pub scrollable_state: scrollable::State,
     pub columns: Vec<CatalogColumnSettingState>,
 }
 
 impl Default for CatalogColumnSettings {
     fn default() -> Self {
         CatalogColumnSettings {
-            scrollable_state: Default::default(),
             columns: vec![
                 CatalogColumnSettingState {
                     key: CatalogColumnKey::Title,
@@ -1938,8 +1905,9 @@ pub enum InstallKind {
     Import { repo_kind: RepositoryKind },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub enum CatalogCategory {
+    #[default]
     All,
     Choice(String),
 }
@@ -1956,24 +1924,13 @@ impl std::fmt::Display for CatalogCategory {
     }
 }
 
-impl Default for CatalogCategory {
-    fn default() -> Self {
-        CatalogCategory::All
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub enum CatalogResultSize {
+    #[default]
     _25,
     _50,
     _100,
     _500,
-}
-
-impl Default for CatalogResultSize {
-    fn default() -> Self {
-        CatalogResultSize::_25
-    }
 }
 
 impl CatalogResultSize {

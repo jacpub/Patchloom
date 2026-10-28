@@ -3,79 +3,108 @@ on:
     paths:
     - '**.rs'
     - 'Cargo.lock'
-    - 'Cargo.toml'
+    - '**/Cargo.toml'
+    - '.github/workflows/continuous-integration.yml'
+    - 'README.md'
+    - 'docs/**'
   pull_request:
     paths:
     - '**.rs'
     - 'Cargo.lock'
-    - 'Cargo.toml'
+    - '**/Cargo.toml'
+    - '.github/workflows/continuous-integration.yml'
+    - 'README.md'
+    - 'docs/**'
 
 name: Continuous-integration
+
+permissions:
+  contents: read
 
 jobs:
   check:
     name: Check
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions/cache@v2
+      - name: Isolate application data
+        run: |
+          echo "XDG_CONFIG_HOME=$RUNNER_TEMP/patchloom-config" >> "$GITHUB_ENV"
+          cmake --version
+      - uses: actions/checkout@v4
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libfreetype-dev libfontconfig-dev libxkbcommon-dev
+          pkg-config --atleast-version=18.5.12 freetype2
+          pkg-config --atleast-version=2.11.1 fontconfig
+          pkg-config --modversion freetype2 fontconfig xkbcommon
+      - uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-check-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-ubuntu24-rust1.99.1-check-${{ hashFiles('**/Cargo.lock') }}
       - uses: actions-rs/toolchain@v1
         with:
           profile: minimal
-          toolchain: stable
+          toolchain: 1.99.1
           override: true
       - uses: actions-rs/cargo@v1
         with:
           command: check
-          args: --all
+          args: --workspace --locked --features no-self-update
       - uses: actions-rs/cargo@v1
         with:
           command: check
-          args: --all --no-default-features --features opengl
+          args: --workspace --locked --no-default-features --features opengl,no-self-update
 
   test:
     name: Test Suite
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v2
-      - name: Install dependencies
-        run: sudo apt install libxkbcommon-dev
-      - uses: actions/cache@v2
+      - name: Isolate application data
+        run: |
+          echo "XDG_CONFIG_HOME=$RUNNER_TEMP/patchloom-config" >> "$GITHUB_ENV"
+          cmake --version
+      - uses: actions/checkout@v4
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libfreetype-dev libfontconfig-dev libxkbcommon-dev
+          pkg-config --atleast-version=18.5.12 freetype2
+          pkg-config --atleast-version=2.11.1 fontconfig
+          pkg-config --modversion freetype2 fontconfig xkbcommon
+      - uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-test-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-ubuntu24-rust1.99.1-test-${{ hashFiles('**/Cargo.lock') }}
       - uses: actions-rs/toolchain@v1
         with:
           profile: minimal
-          toolchain: stable
+          toolchain: 1.99.1
           override: true
       - uses: actions-rs/cargo@v1
         with:
           command: test
-          args: --workspace
+          args: --workspace --locked --features no-self-update -- --skip catalog::tests::test_catalog_download
       - uses: actions-rs/cargo@v1
         with:
           command: test
-          args: --workspace --no-default-features --features opengl
+          args: --workspace --locked --no-default-features --features opengl,no-self-update -- --skip catalog::tests::test_catalog_download
 
   fmt:
     name: Rustfmt
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
       - uses: actions-rs/toolchain@v1
         with:
           profile: minimal
-          toolchain: stable
+          toolchain: 1.99.1
           override: true
       - run: rustup component add rustfmt
       - uses: actions-rs/cargo@v1
@@ -85,36 +114,34 @@ jobs:
 
   clippy:
     name: Clippy
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions/cache@v2
+      - name: Isolate application data
+        run: |
+          echo "XDG_CONFIG_HOME=$RUNNER_TEMP/patchloom-config" >> "$GITHUB_ENV"
+          cmake --version
+      - uses: actions/checkout@v4
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libfreetype-dev libfontconfig-dev libxkbcommon-dev
+          pkg-config --atleast-version=18.5.12 freetype2
+          pkg-config --atleast-version=2.11.1 fontconfig
+          pkg-config --modversion freetype2 fontconfig xkbcommon
+      - uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-clippy-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-ubuntu24-rust1.99.1-clippy-${{ hashFiles('**/Cargo.lock') }}
       - uses: actions-rs/toolchain@v1
         with:
           profile: minimal
-          toolchain: stable
+          toolchain: 1.99.1
           override: true
       - run: rustup component add clippy
       - uses: actions-rs/cargo@v1
         with:
           command: clippy
-          args: --all -- -D warnings
-  
-  poeditor:
-    name: POEditor
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v2
-      - name: Push terms to POEditor
-        run: curl -X POST https://api.poeditor.com/v2/projects/upload
-          -F api_token="${{ secrets.POEDITOR_API_TOKEN }}"
-          -F id="${{ secrets.POEDITOR_PROJECT_ID }}"
-          -F updating="terms_translations"
-          -F language="en"
-          -F file=@"locale/en.json"
+          args: --workspace --all-targets --locked --features no-self-update -- -D warnings

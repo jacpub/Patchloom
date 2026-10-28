@@ -14,6 +14,13 @@ and `Removed`.
 
 ## [Unreleased]
 
+### Fixed
+
+- Stage and validate addon archives before replacement, retain original folders
+  for rollback, and preserve ambiguous interrupted updates for explicit recovery.
+  This development change has fixture and Windows process tests; live WoW and
+  native macOS/Linux validation remain pending.
+
 ## [1.3.2] - 2021-09-23
 
 ### Added

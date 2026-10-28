@@ -1,3 +1,4 @@
+// Patchloom lint maintenance, 2026-10-27; original license and attribution apply.
 #![allow(clippy::too_many_arguments)]
 
 use ajour_core::{config::Flavor, repository::CompressionFormat};
@@ -55,8 +56,7 @@ pub fn data_container<'a, 'b>(
                 .wow
                 .directories
                 .get(&flavor)
-                .map(|p| p.to_str())
-                .flatten()
+                .and_then(|p| p.to_str())
                 .unwrap_or("-");
             let flavor_text = Text::new(flavor.to_string())
                 .size(14)
@@ -356,8 +356,7 @@ pub fn data_container<'a, 'b>(
         // We only show the option if any exists.
         let any_fonts_folders = &Flavor::ALL[..]
             .iter()
-            .map(|f| config.get_fonts_directory_for_flavor(f))
-            .flatten()
+            .filter_map(|f| config.get_fonts_directory_for_flavor(f))
             .any(|p| p.exists());
         if *any_fonts_folders {
             backup_directory_row = backup_directory_row
