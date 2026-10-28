@@ -89,6 +89,14 @@ pub struct Opts {
         help = "Check hidden native preview startup and exit"
     )]
     pub preview_window_check: bool,
+    // Added 2026-10-28; original GPLv3 applies.
+    #[structopt(
+        long,
+        hidden = true,
+        help = "Check safe startup without opening a window"
+    )]
+    pub startup_check: bool,
+
     #[structopt(long = "data", help = "Path to a custom data directory for the app")]
     pub data_directory: Option<PathBuf>,
     #[structopt(long = "aa", help = "Enable / Disable Anti-aliasing (true / false)")]
@@ -97,6 +105,17 @@ pub struct Opts {
     pub command: Option<Command>,
     #[structopt(long, hidden = true)]
     pub self_update_temp: Option<PathBuf>,
+}
+
+// Added 2026-10-28; original GPLv3 applies.
+impl Opts {
+    pub fn uses_safe_startup(&self) -> bool {
+        self.command.is_none()
+            || self.preview.is_some()
+            || self.preview_check
+            || self.preview_window_check
+            || self.startup_check
+    }
 }
 
 #[derive(Debug, StructOpt)]
@@ -185,6 +204,144 @@ mod tests {
     fn preview_check_flags_require_an_explicit_path() {
         for flag in ["--preview-check", "--preview-window-check"] {
             assert!(Opts::from_iter_safe(["ajour", flag]).is_err());
+        }
+    }
+
+    // Added 2026-10-28; original GPLv3 applies.
+    #[test]
+    fn no_arguments_and_gui_options_use_the_actual_safe_entry_decision() {
+        let opts = Opts::from_iter_safe(["ajour"]).unwrap();
+        assert!(opts.command.is_none());
+        assert!(opts.preview.is_none());
+        assert!(!opts.preview_check);
+        assert!(!opts.preview_window_check);
+        assert!(!opts.startup_check);
+        assert!(opts.uses_safe_startup());
+
+        for args in [
+            vec!["ajour", "--aa", "true"],
+            vec!["ajour", "--aa", "false"],
+            vec!["ajour", "--data", "isolated-data"],
+            vec!["ajour", "--self-update-temp", "cleanup-sentinel"],
+            vec!["ajour", "--startup-check"],
+            vec!["ajour", "--preview", "copied-wow"],
+        ] {
+            let opts = Opts::from_iter_safe(args).unwrap();
+            assert!(opts.command.is_none());
+            assert!(opts.uses_safe_startup());
+        }
+    }
+
+    #[test]
+    fn startup_check_does_not_relax_existing_explicit_path_requirements() {
+        let opts = Opts::from_iter_safe(["ajour", "--startup-check"]).unwrap();
+        assert!(opts.startup_check);
+        assert!(opts.preview.is_none());
+        assert!(opts.uses_safe_startup());
+
+        for flag in ["--preview-check", "--preview-window-check"] {
+            assert!(Opts::from_iter_safe(["ajour", "--startup-check", flag]).is_err());
+            let opts = Opts::from_iter_safe(["ajour", "--preview", "copied-wow", flag]).unwrap();
+            assert!(opts.preview.is_some());
+            assert!(opts.uses_safe_startup());
+        }
+
+        let opts = Opts::from_iter_safe(["ajour", "--preview", "", "--startup-check"]).unwrap();
+        assert_eq!(opts.preview, Some(PathBuf::new()));
+        assert!(opts.uses_safe_startup());
+    }
+
+    #[test]
+    fn explicit_legacy_subcommands_still_parse_without_selecting_safe_gui() {
+        for (name, expected) in [("update", 0), ("update-addons", 1), ("update-auras", 2)] {
+            let opts = Opts::from_iter_safe(["ajour", name]).unwrap();
+            assert!(!opts.uses_safe_startup());
+            match (expected, opts.command.unwrap()) {
+                (0, Command::Update) | (1, Command::UpdateAddons) | (2, Command::UpdateAuras) => {}
+                other => panic!("Unexpected command: {:?}", other),
+            }
+        }
+
+        let opts = Opts::from_iter_safe([
+            "ajour",
+            "install",
+            "retail",
+            "https://invalid.invalid/fixture",
+        ])
+        .unwrap();
+        assert!(!opts.uses_safe_startup());
+        match opts.command.unwrap() {
+            Command::Install { flavor, url } => {
+                assert!(matches!(flavor, Flavor::Retail));
+                assert_eq!(url.to_string(), "https://invalid.invalid/fixture");
+            }
+            other => panic!("Unexpected command: {:?}", other),
+        }
+
+        let opts = Opts::from_iter_safe(["ajour", "backup", "copied-backup"]).unwrap();
+        assert!(!opts.uses_safe_startup());
+        match opts.command.unwrap() {
+            Command::Backup {
+                backup_folder,
+                destination,
+                flavors,
+                level,
+                ..
+            } => {
+                assert!(matches!(backup_folder, BackupFolder::All));
+                assert_eq!(destination, PathBuf::from("copied-backup"));
+                assert!(flavors.is_empty());
+                assert_eq!(level, 0);
+            }
+            other => panic!("Unexpected command: {:?}", other),
+        }
+
+        let opts = Opts::from_iter_safe(["ajour", "path-add", "copied-wow", "retail"]).unwrap();
+        assert!(!opts.uses_safe_startup());
+        match opts.command.unwrap() {
+            Command::PathAdd { path, flavor } => {
+                assert_eq!(path, PathBuf::from("copied-wow"));
+                assert!(matches!(flavor, Some(Flavor::Retail)));
+            }
+            other => panic!("Unexpected command: {:?}", other),
+        }
+
+        let opts = Opts::from_iter_safe(["ajour", "--data", "isolated-data", "update"]).unwrap();
+        assert_eq!(opts.data_directory, Some(PathBuf::from("isolated-data")));
+        assert!(!opts.uses_safe_startup());
+    }
+
+    #[test]
+    fn mixed_preview_and_command_options_route_to_rejection_not_command_execution() {
+        for args in [
+            vec!["ajour", "--startup-check", "update"],
+            vec![
+                "ajour",
+                "--preview",
+                "copied-wow",
+                "--startup-check",
+                "update",
+            ],
+            vec![
+                "ajour",
+                "--preview",
+                "copied-wow",
+                "--preview-check",
+                "update",
+            ],
+        ] {
+            let opts = Opts::from_iter_safe(args).unwrap();
+            assert!(opts.command.is_some());
+            assert!(opts.uses_safe_startup());
+
+            // Call only the isolated entry. Never dispatch the CLI command.
+            // Every invocation is headless even if command rejection regresses.
+            let error = crate::inventory_preview::run(&opts).unwrap_err();
+            if cfg!(feature = "no-self-update") {
+                assert!(error.to_string().contains("legacy commands"));
+            } else {
+                assert!(error.to_string().contains("no-self-update"));
+            }
         }
     }
 }

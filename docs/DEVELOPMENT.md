@@ -22,12 +22,22 @@ unresolved TOCs remain visible for review. Keep using copied development fixture
 Add `--preview-check` to construct the same model and view without opening a
 window. It prints JSON and exits unsuccessfully when discovery needs review.
 The hidden `--preview-window-check` developer switch opens an invisible native
-window and exits after a short timer. Do not combine either check mode with
-legacy commands, `--data` or `--self-update-temp`.
+window and exits after a short timer. Both switches require `--preview`.
 
-Starting the executable without `--preview` still enters the legacy application.
+The hidden `--startup-check` developer switch checks the safe startup constructor
+and view without creating a native window. Without `--preview`, it checks the
+empty landing. With `--preview`, it also completes local discovery through the
+existing command and dispatch path. It prints a JSON acceptance envelope and
+fails when explicitly selected inventory needs review. Do not combine check
+modes with each other, legacy commands, `--data` or `--self-update-temp`.
+
+Starting the executable without a subcommand opens the isolated landing view.
+Enter a copied WoW folder path and click Open to read its inventory. Startup
+does not load legacy configuration or remember a selected root. Default GUI
+startup rejects `--data` and `--self-update-temp` without touching those paths.
+Development GUI builds require the `no-self-update` feature.
 The preview includes inventory, ownership receipt inspection and explicit release
-checks. GUI installation, recovery and default-startup migration remain
+checks. GUI installation, recovery and persisted-root migration remain
 unfinished. Its neutral draft surfaces await review against the saved Patchloom
 brand guide. Windows OpenGL startup has been checked with copied fixtures;
 visible layout and native macOS/Linux GUI runtime checks remain pending.
@@ -93,15 +103,15 @@ WoW installation or your normal application configuration.
 
 | Target | Reported validation |
 | --- | --- |
-| Windows x64 | 121 tests/config; strict Clippy and formatting pass |
-| Linux x64 | Published base: CI green, 80 tests/config |
+| Windows x64 | 140 tests/config; strict Clippy and formatting pass |
+| Linux x64 | Published base: CI green, 113 tests/config |
 | macOS | Native build, runtime and packaging validation pending |
 
 The Windows checks also include the explicit paired receipt bridge.
 The Linux result is for Ubuntu 24.04 at commit
-`14ed00ca9422f16f1526b5bd44acedf3797d278c`.
+`b1413507c80478a5e8ce61e8abe036dc88f12738`.
 
-The Windows row covers the local retry correction. The Linux row covers the
+The Windows row covers the local startup changes. The Linux row covers the
 published base; hosted CI for this correction has not run. Native macOS/Linux
 GUI checks remain pending.
 

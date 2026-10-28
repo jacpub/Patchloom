@@ -10,6 +10,7 @@ use std::{path::PathBuf, sync::Arc, time::Instant};
 #[derive(Debug, Clone)]
 struct ScanRequest {
     root: PathBuf,
+    generation: Arc<()>,
     token: Arc<()>,
 }
 #[derive(Debug, Clone)]
@@ -83,6 +84,8 @@ fn serialize_inventory<S: serde::Serializer>(
 #[derive(Debug, Serialize)]
 struct Model {
     root: PathBuf,
+    #[serde(skip)]
+    generation: Arc<()>,
     #[serde(serialize_with = "serialize_inventory")]
     inventory: Option<Arc<Discovery>>,
     error: Option<String>,
@@ -116,6 +119,7 @@ impl Model {
     fn new(root: PathBuf) -> Self {
         Self {
             root,
+            generation: Arc::new(()),
             inventory: None,
             error: None,
             selected: None,
@@ -133,6 +137,23 @@ impl Model {
             release_retry_at: None,
         }
     }
+    // Modified 2026-10-28; original GPLv3 applies.
+    // Logical invalidation never releases a physical worker or provider wait.
+    fn invalidate_snapshot(&mut self) {
+        self.generation = Arc::new(());
+        self.scan_requested = false;
+        self.inventory = None;
+        self.selected = None;
+        self.error = None;
+        self.clear_receipt();
+        self.clear_release();
+    }
+
+    fn set_root(&mut self, root: PathBuf) {
+        self.invalidate_snapshot();
+        self.root = root;
+    }
+
     // Synchronous only for the deterministic headless check and fixture tests.
     fn refresh(&mut self) {
         if let Some(request) = self.begin_scan() {
@@ -141,23 +162,28 @@ impl Model {
         }
     }
     fn begin_scan(&mut self) -> Option<ScanRequest> {
-        self.clear_release();
-        self.selected = None;
-        self.inventory = None;
-        self.error = None;
-        self.clear_receipt();
+        self.invalidate_snapshot();
+        if self.root.as_os_str().is_empty() {
+            self.error = Some("Enter a copied WoW folder path, then click Open.".into());
+            return None;
+        }
         self.scan_requested = true;
         self.start_scan()
     }
     // Modified 2026-10-28; original GPLv3 applies.
     // ponytail: one snapshot worker; split only if measured latency requires it.
     fn start_scan(&mut self) -> Option<ScanRequest> {
-        if !self.scan_requested || self.scan.is_some() || self.receipt_worker.is_some() {
+        if !self.scan_requested
+            || self.root.as_os_str().is_empty()
+            || self.scan.is_some()
+            || self.receipt_worker.is_some()
+        {
             return None;
         }
         self.scan_requested = false;
         let request = ScanRequest {
             root: self.root.clone(),
+            generation: self.generation.clone(),
             token: Arc::new(()),
         };
         self.scan = Some(request.token.clone());
@@ -178,7 +204,10 @@ impl Model {
         }
         // Only this physical completion may release this reservation.
         self.scan = None;
-        if self.root != request.root || self.scan_requested {
+        if self.root != request.root
+            || self.scan_requested
+            || !Arc::ptr_eq(&self.generation, &request.generation)
+        {
             return false;
         }
         match result {
@@ -623,6 +652,8 @@ fn folder_summary(folders: &[String]) -> String {
 
 #[derive(Debug, Clone)]
 enum Message {
+    RootInputChanged(String),
+    OpenRoot,
     Select(Product),
     Rescan,
     InventoryDone(ScanRequest, Result<Arc<Discovery>, String>),
@@ -644,6 +675,10 @@ struct Flags {
 }
 struct Preview {
     model: Model,
+    root_input: String,
+    root_edited: bool,
+    root_input_state: text_input::State,
+    open_root: button::State,
     choices: Vec<button::State>,
     rescan: button::State,
     receipt_input: text_input::State,
@@ -656,8 +691,13 @@ struct Preview {
 }
 impl Preview {
     fn from_model(model: Model, native_check: bool) -> Self {
+        let root_input = model.root.to_string_lossy().into_owned();
         let mut app = Self {
             model,
+            root_input,
+            root_edited: false,
+            root_input_state: text_input::State::new(),
+            open_root: button::State::new(),
             choices: vec![],
             rescan: button::State::new(),
             receipt_input: text_input::State::new(),
@@ -673,8 +713,34 @@ impl Preview {
     }
     fn dispatch(&mut self, message: Message) -> Command<Message> {
         match message {
+            Message::RootInputChanged(input) => {
+                if self.root_input != input {
+                    self.root_input = input;
+                    self.root_edited = true;
+                    self.model.invalidate_snapshot();
+                    self.synchronize_choices();
+                }
+                // Typing also cancels any queued scan. An old physical worker
+                // keeps its reservation until its matching completion arrives.
+                return Command::none();
+            }
+            Message::OpenRoot => {
+                let root = if self.root_edited {
+                    PathBuf::from(&self.root_input)
+                } else {
+                    self.model.root.clone()
+                };
+                self.model.set_root(root);
+                self.root_edited = false;
+                let request = self.model.begin_scan();
+                self.synchronize_choices();
+                return request.map_or_else(Command::none, scan_command);
+            }
             Message::Select(product) => self.model.select(product),
             Message::Rescan => {
+                if self.root_edited {
+                    return Command::none();
+                }
                 let request = self.model.begin_scan();
                 self.synchronize_choices();
                 return request.map_or_else(Command::none, scan_command);
@@ -734,7 +800,11 @@ impl Application for Preview {
     type Flags = Flags;
     fn new(flags: Flags) -> (Self, Command<Message>) {
         let mut model = Model::new(flags.root);
-        let command = model.begin_scan().map_or_else(Command::none, scan_command);
+        let command = if model.root.as_os_str().is_empty() {
+            Command::none()
+        } else {
+            model.begin_scan().map_or_else(Command::none, scan_command)
+        };
         (Self::from_model(model, flags.native_check), command)
     }
     fn title(&self) -> String {
@@ -762,15 +832,43 @@ impl Application for Preview {
         self.dispatch(message)
     }
     fn view(&mut self) -> Element<'_, Message> {
+        let mut rescan = Button::new(&mut self.rescan, Text::new("Rescan folder"));
+        if !self.root_edited && !self.model.root.as_os_str().is_empty() {
+            rescan = rescan.on_press(Message::Rescan);
+        }
+
         let mut content = Column::new()
             .spacing(14)
             .push(Text::new("Patchloom").size(32))
             .push(Text::new("WoW addon inventory").size(22))
             .push(Text::new("Read-only preview. Your files will not be changed.").size(16))
-            .push(Text::new(self.model.root.display().to_string()).size(14))
+            .push(Text::new(
+                "Development build. Enter a copied WoW folder path, then click Open.",
+            ))
             .push(
-                Button::new(&mut self.rescan, Text::new("Rescan folder")).on_press(Message::Rescan),
+                Row::new()
+                    .spacing(12)
+                    .push(
+                        TextInput::new(
+                            &mut self.root_input_state,
+                            "Copied World of Warcraft folder",
+                            &self.root_input,
+                            Message::RootInputChanged,
+                        )
+                        .width(Length::Fill),
+                    )
+                    .push(
+                        Button::new(&mut self.open_root, Text::new("Open"))
+                            .on_press(Message::OpenRoot),
+                    ),
+            )
+            .push(rescan);
+
+        if !self.root_edited && !self.model.root.as_os_str().is_empty() {
+            content = content.push(
+                Text::new(clip(&self.model.root.display().to_string(), ERROR_CHARS)).size(14),
             );
+        }
         if let Some(status) = self.model.scan_status() {
             content = content.push(Text::new(status));
         }
@@ -985,18 +1083,84 @@ impl container::StyleSheet for Surface {
     }
 }
 
+// Added 2026-10-28; original GPLv3 applies.
+// Runs the actual Application constructor and local completion dispatch.
+// Does not start a native application, executor, subscription or clipboard.
+fn check_startup(root: PathBuf, explicit_root: bool) -> crate::Result<()> {
+    let empty_root = root.as_os_str().is_empty();
+    let (mut app, command) = Preview::new(Flags {
+        root,
+        native_check: false,
+    });
+    let mut futures = command.futures();
+    let initial_commands = futures.len();
+    let expected_commands = if empty_root { 0 } else { 1 };
+
+    if initial_commands != expected_commands
+        || app.model.receipt_worker.is_some()
+        || app.model.release_worker.is_some()
+        || app.model.pending_release.is_some()
+    {
+        anyhow::bail!("Unexpected work during safe startup");
+    }
+
+    if empty_root && explicit_root {
+        // An explicitly supplied empty path is invalid, not a request to
+        // discover the working directory or accept the rootless landing.
+        if !app.dispatch(Message::OpenRoot).futures().is_empty() {
+            anyhow::bail!("Unexpected work for an empty WoW path");
+        }
+    }
+
+    if initial_commands == 1 {
+        let message = async_std::task::block_on(futures.remove(0));
+        match message {
+            Message::InventoryDone(request, result) => {
+                let next = app.dispatch(Message::InventoryDone(request, result));
+                if !next.futures().is_empty() {
+                    anyhow::bail!("Unexpected follow-up work during safe startup");
+                }
+            }
+            _ => anyhow::bail!("Unexpected completion during safe startup"),
+        }
+    }
+
+    drop(app.view());
+    serde_json::to_writer(
+        std::io::stdout(),
+        &serde_json::json!({
+            "entry": "safe-startup",
+            "initial_commands": initial_commands,
+            "model": &app.model,
+        }),
+    )?;
+    if explicit_root && app.model.needs_review() {
+        anyhow::bail!("Some inventory items need review");
+    }
+    Ok(())
+}
+
 pub fn run(opts: &crate::cli::Opts) -> crate::Result<()> {
-    let root = opts
-        .preview
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("An explicit copied WoW path is required"))?;
+    if !cfg!(feature = "no-self-update") {
+        anyhow::bail!("This development build requires the no-self-update feature");
+    }
     if opts.command.is_some() || opts.data_directory.is_some() || opts.self_update_temp.is_some() {
         anyhow::bail!(
             "Preview cannot be combined with legacy commands, --data or --self-update-temp"
         );
     }
-    if opts.preview_check && opts.preview_window_check {
+    if (opts.preview_check && opts.preview_window_check)
+        || (opts.startup_check && (opts.preview_check || opts.preview_window_check))
+    {
         anyhow::bail!("Choose one preview check mode");
+    }
+    if (opts.preview_check || opts.preview_window_check) && opts.preview.is_none() {
+        anyhow::bail!("An explicit copied WoW path is required");
+    }
+
+    let root = opts.preview.clone().unwrap_or_default();
+    if opts.startup_check {
+        return check_startup(root, opts.preview.is_some());
     }
     if opts.preview_check {
         // Complete the headless snapshot without starting an executor.
@@ -1201,7 +1365,7 @@ mod tests {
                     model.select(Product::Retail);
                 }
                 _ => {
-                    model.root = model.root.join("another-root");
+                    model.set_root(model.root.join("another-root"));
                     assert!(model.begin_scan().is_none());
                 }
             }
@@ -1224,7 +1388,7 @@ mod tests {
                 assert!(model.scan.is_some());
                 assert!(deliver(&mut model, scan_command(scan)));
             }
-            model.root = temp.path().into();
+            model.set_root(temp.path().into());
             model.refresh();
             model.select(Product::Retail);
             assert!(model.begin_receipt().is_some());
@@ -1244,7 +1408,7 @@ mod tests {
                     assert!(model.begin_scan().is_some());
                 }
                 _ => {
-                    model.root = model.root.join("another-root");
+                    model.set_root(model.root.join("another-root"));
                     assert!(model.begin_scan().is_some());
                 }
             }
@@ -1297,14 +1461,14 @@ mod tests {
         assert!(model.inventory.is_some());
         assert!(!model.complete_scan(newer, Err("duplicate".into())));
         let changed = model.begin_scan().unwrap();
-        model.root = model.root.join("different-root");
+        model.set_root(model.root.join("different-root"));
         assert!(!deliver(&mut model, scan_command(changed)));
         assert!(model.scan.is_none());
         let failing = model.begin_scan().unwrap();
         assert!(deliver(&mut model, scan_command(failing)));
         assert!(model.error.is_some());
         assert!(model.inventory.is_none());
-        model.root = original;
+        model.set_root(original);
         let retry = model.begin_scan().unwrap();
         assert!(deliver(&mut model, scan_command(retry)));
         assert!(model.error.is_none());
@@ -1315,7 +1479,7 @@ mod tests {
     fn receipt_root_guard_rejects_a_changed_root_before_another_scan() {
         let (_temp, mut model) = receipt_model();
         let request = model.begin_receipt().unwrap();
-        model.root = model.root.join("different-root");
+        model.set_root(model.root.join("different-root"));
         assert!(!model.complete_receipt(request.clone(), Ok(matching_receipt(&request))));
         assert!(model.receipt.is_none());
     }
@@ -1715,10 +1879,8 @@ mod tests {
                 0 => model.set_repository("other/addon".into()),
                 1 => model.select(Product::ClassicProgression),
                 2 => {
-                    // Exercise the completion root guard without relying
-                    // on pending-request invalidation.
-                    model.root = model.root.join("different-root");
-                    assert!(model.pending_release.is_some());
+                    model.set_root(model.root.join("different-root"));
+                    assert!(model.pending_release.is_none());
                 }
                 _ => {
                     // A local rescan can complete while provider capacity
@@ -1760,10 +1922,7 @@ mod tests {
                     0 => model.set_repository("other/addon".into()),
                     1 => model.select(Product::ClassicProgression),
                     2 => {
-                        // No root-edit UI/setter exists in the supplied
-                        // source. A root switch followed by refresh is the
-                        // available model path that invalidates discovery.
-                        model.root = model.root.join("different-root");
+                        model.set_root(model.root.join("different-root"));
                         model.refresh();
                         assert!(model.error.is_some());
                     }
@@ -1795,9 +1954,9 @@ mod tests {
                     model.select(Product::Retail);
                 }
                 _ => {
-                    model.root = original_root.join("different-root");
+                    model.set_root(original_root.join("different-root"));
                     model.refresh();
-                    model.root = original_root;
+                    model.set_root(original_root);
                     model.refresh();
                     model.select(Product::Retail);
                 }
@@ -2196,22 +2355,34 @@ mod tests {
                     no_command(app.dispatch(Message::Select(Product::Retail)));
                 }
                 3 => {
-                    // There is no root-edit message. Use the supplied model
-                    // root transition, with actual dispatched rescans.
                     let original = app.model.root.clone();
-                    app.model.root = original.join("missing-fixture-root");
-                    let command = app.dispatch(Message::Rescan);
+                    let missing = original.join("missing-fixture-root");
+                    no_command(app.dispatch(Message::RootInputChanged(
+                        missing.to_str().expect("UTF-8 fixture path").into(),
+                    )));
+                    let command = app.dispatch(Message::OpenRoot);
                     finish_local(app, command);
                     assert!(app.model.error.is_some());
-                    app.model.root = original;
-                    let command = app.dispatch(Message::Rescan);
+                    no_command(app.dispatch(Message::RootInputChanged(
+                        original.to_str().expect("UTF-8 fixture path").into(),
+                    )));
+                    let command = app.dispatch(Message::OpenRoot);
                     finish_local(app, command);
                     no_command(app.dispatch(Message::Select(Product::Retail)));
                 }
                 _ => {
-                    // Exercise the completion root guard without clearing
-                    // pending_release through another action.
-                    app.model.root = app.model.root.join("different-root");
+                    let original = app.model.root.clone();
+                    let away = original.join("draft-only-root");
+                    no_command(app.dispatch(Message::RootInputChanged(
+                        away.to_str().expect("UTF-8 fixture path").into(),
+                    )));
+                    no_command(app.dispatch(Message::RootInputChanged(
+                        original.to_str().expect("UTF-8 fixture path").into(),
+                    )));
+                    assert!(app.model.pending_release.is_none());
+                    let command = app.dispatch(Message::OpenRoot);
+                    finish_local(app, command);
+                    no_command(app.dispatch(Message::Select(Product::Retail)));
                 }
             }
         }
@@ -2272,7 +2443,6 @@ mod tests {
             for wait in [Duration::from_secs(172_800), Duration::MAX] {
                 for change in 0..5 {
                     let (_temp, mut app) = app_fixture();
-                    let root = app.model.root.clone();
                     let request = click_once(&mut app);
                     invalidate(&mut app, change);
                     assert!(app
@@ -2280,11 +2450,7 @@ mod tests {
                         .release_worker
                         .as_ref()
                         .is_some_and(|token| Arc::ptr_eq(token, &request.token)));
-                    if change == 4 {
-                        assert!(app.model.pending_release.is_some());
-                    } else {
-                        assert!(app.model.pending_release.is_none());
-                    }
+                    assert!(app.model.pending_release.is_none());
                     no_command(app.dispatch(Message::CheckRelease));
 
                     let deadline = rate_completion(
@@ -2297,11 +2463,9 @@ mod tests {
                     assert!(app.model.pending_release.is_none());
                     assert!(app.model.release_result.is_none());
                     assert_eq!(app.model.release_retry_at, Some(deadline));
-                    app.model.root = root.clone();
 
                     // Later input/product/discovery changes also retain it.
                     invalidate(&mut app, change);
-                    app.model.root = root;
                     assert!(app.model.release_inputs_ready());
                     assert_eq!(app.model.release_retry_at, Some(deadline));
                     no_command(app.dispatch(Message::CheckRelease));
@@ -2548,6 +2712,547 @@ mod tests {
             drop(app.view());
             for (path, bytes) in paths.iter().zip(&before) {
                 assert_eq!(&std::fs::read(path).unwrap(), bytes);
+            }
+        }
+    }
+
+    // Added 2026-10-28; original GPLv3 applies.
+    mod startup_root_tests {
+        use super::*;
+        use std::{path::Path, time::Duration};
+
+        fn no_command(command: Command<Message>) {
+            assert!(command.futures().is_empty());
+        }
+
+        // Call only with a command returned by constructor/Open/Rescan or
+        // InspectReceipt. Never pass CheckRelease commands here.
+        fn local_message(command: Command<Message>) -> Message {
+            let mut futures = command.futures();
+            assert_eq!(futures.len(), 1);
+            let message = async_std::task::block_on(futures.remove(0));
+            assert!(matches!(
+                &message,
+                Message::InventoryDone(..) | Message::ReceiptDone(..)
+            ));
+            message
+        }
+
+        fn finish_local(app: &mut Preview, command: Command<Message>) {
+            let message = local_message(command);
+            no_command(app.dispatch(message));
+        }
+
+        fn edit(app: &mut Preview, root: &Path) {
+            no_command(app.dispatch(Message::RootInputChanged(
+                root.to_str().expect("UTF-8 fixture path").into(),
+            )));
+        }
+
+        fn open(app: &mut Preview, root: &Path) -> Command<Message> {
+            edit(app, root);
+            app.dispatch(Message::OpenRoot)
+        }
+
+        fn owns(worker: Option<&Arc<()>>, token: &Arc<()>) {
+            assert!(worker.is_some_and(|worker| Arc::ptr_eq(worker, token)));
+        }
+
+        fn invalidated(app: &Preview) {
+            assert!(app.model.inventory.is_none());
+            assert!(app.model.selected.is_none());
+            assert!(app.model.error.is_none());
+            assert!(app.choices.is_empty());
+            assert!(app.model.receipt.is_none());
+            assert!(app.model.receipt_error.is_none());
+            assert!(app.model.pending_receipt.is_none());
+            assert!(app.model.release_result.is_none());
+            assert!(app.model.pending_release.is_none());
+        }
+
+        fn click_release(app: &mut Preview) -> ReleaseRequest {
+            let futures = app.dispatch(Message::CheckRelease).futures();
+            assert_eq!(futures.len(), 1);
+            let request = app.model.pending_release.as_ref().unwrap().clone();
+            owns(app.model.release_worker.as_ref(), &request.token);
+            drop(futures);
+            request
+        }
+
+        fn tree(root: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
+            fn visit(root: &Path, path: &Path, entries: &mut Vec<(PathBuf, Option<Vec<u8>>)>) {
+                entries.push((
+                    path.strip_prefix(root).unwrap().into(),
+                    if path.is_file() {
+                        Some(std::fs::read(path).unwrap())
+                    } else {
+                        None
+                    },
+                ));
+                if path.is_dir() {
+                    for entry in std::fs::read_dir(path).unwrap() {
+                        visit(root, &entry.unwrap().path(), entries);
+                    }
+                }
+            }
+            let mut entries = Vec::new();
+            visit(root, root, &mut entries);
+            entries.sort();
+            entries
+        }
+
+        #[test]
+        fn empty_constructor_view_and_empty_open_do_no_work_or_fixture_writes() {
+            for config_state in 0..3 {
+                let temp = tempfile::tempdir().unwrap();
+                let config = temp.path().join("isolated-config");
+                if config_state != 0 {
+                    std::fs::create_dir(&config).unwrap();
+                }
+                if config_state == 2 {
+                    std::fs::write(config.join("existing-config"), b"preserve\n").unwrap();
+                }
+                let before = tree(temp.path());
+
+                let (mut app, command) = Preview::new(Flags {
+                    root: PathBuf::new(),
+                    native_check: false,
+                });
+                no_command(command);
+                invalidated(&app);
+                assert!(app.model.root.as_os_str().is_empty());
+                assert!(app.root_input.is_empty());
+                assert!(!app.root_edited);
+                assert!(app.model.scan.is_none());
+                assert!(app.model.receipt_worker.is_none());
+                assert!(app.model.release_worker.is_none());
+                assert!(!app.model.scan_requested);
+                assert!(app.model.release_retry_at.is_none());
+                assert!(app.subscription().recipes().is_empty());
+                drop(app.view());
+
+                no_command(app.dispatch(Message::CheckRelease));
+                no_command(app.dispatch(Message::InspectReceipt));
+                no_command(app.dispatch(Message::Rescan));
+                assert!(app.model.error.is_some());
+                assert!(app.model.scan.is_none());
+
+                edit(&mut app, &temp.path().join("not-opened"));
+                no_command(app.dispatch(Message::RootInputChanged(String::new())));
+                invalidated(&app);
+                no_command(app.dispatch(Message::OpenRoot));
+                assert!(app.model.error.is_some());
+                assert!(app.model.inventory.is_none());
+                assert!(app.model.scan.is_none());
+                assert!(!app.model.scan_requested);
+                assert!(app.model.start_scan().is_none());
+                assert_no_release_work(&app.model);
+                assert_eq!(tree(temp.path()), before);
+            }
+        }
+
+        #[test]
+        fn explicit_open_discovers_all_modern_products_and_rejects_bad_roots() {
+            let (temp, _) = receipt_model();
+            for folder in ["_classic_era_", "_anniversary_"] {
+                std::fs::create_dir_all(temp.path().join(folder).join("Interface").join("AddOns"))
+                    .unwrap();
+            }
+            std::fs::write(
+                temp.path().join(".build.info"),
+                concat!(
+                    "Active!DEC:1|Product!STRING:0|Version!STRING:0\n",
+                    "1|wow|12.1.5.70575\n",
+                    "1|wow_classic|5.5.4.70579\n",
+                    "1|wow_classic_era|1.15.7.60000\n",
+                    "1|wow_anniversary|2.5.5.60000\n",
+                ),
+            )
+            .unwrap();
+            let before = tree(temp.path());
+            let (mut app, command) = Preview::new(Flags {
+                root: PathBuf::new(),
+                native_check: false,
+            });
+            no_command(command);
+
+            edit(&mut app, temp.path());
+            assert!(app.model.root.as_os_str().is_empty());
+            assert!(app.model.scan.is_none());
+            assert_no_release_work(&app.model);
+            let command = app.dispatch(Message::OpenRoot);
+            finish_local(&mut app, command);
+
+            let report = app.model.inventory.as_ref().unwrap();
+            assert!(!app.model.needs_review());
+            assert_eq!(report.installations.len(), 4);
+            for product in [
+                Product::Retail,
+                Product::ClassicProgression,
+                Product::ClassicEra,
+                Product::Anniversary,
+            ] {
+                assert!(report.installations.iter().any(|i| i.product == product));
+            }
+            assert_eq!(app.choices.len(), 4);
+            assert!(app.model.selected.is_none());
+            no_command(app.dispatch(Message::Select(Product::Anniversary)));
+            assert_eq!(
+                app.model.installation().unwrap().product,
+                Product::Anniversary
+            );
+            assert_no_release_work(&app.model);
+            assert_eq!(tree(temp.path()), before);
+
+            let missing = temp.path().join("missing-root");
+            let command = open(&mut app, &missing);
+            finish_local(&mut app, command);
+            assert!(app.model.error.is_some());
+            assert!(app.model.inventory.is_none());
+            assert!(app.model.selected.is_none());
+            assert!(app.choices.is_empty());
+            assert!(!missing.exists());
+            assert_no_release_work(&app.model);
+            assert_eq!(tree(temp.path()), before);
+
+            std::fs::write(
+                temp.path().join(".build.info"),
+                concat!(
+                    "Active!DEC:1|Product!STRING:0|Version!STRING:0\n",
+                    "1|wow_unknown|13.0.0.1\n",
+                ),
+            )
+            .unwrap();
+            let before = tree(temp.path());
+            let command = open(&mut app, temp.path());
+            finish_local(&mut app, command);
+            assert!(app.model.needs_review());
+            let report = app.model.inventory.as_ref().unwrap();
+            assert!(report.installations.is_empty());
+            assert!(report
+                .issues
+                .iter()
+                .any(|issue| issue.contains("Unknown product/version family")));
+            assert!(app.model.selected.is_none());
+            assert!(app.choices.is_empty());
+            drop(app.view());
+            assert_no_release_work(&app.model);
+            assert_eq!(tree(temp.path()), before);
+        }
+
+        #[test]
+        fn draft_edits_immediately_clear_success_and_failure_displays() {
+            for failure in [false, true] {
+                let (temp, model) = release_fixture();
+                let mut app = Preview::from_model(model, false);
+                let receipt = app.model.begin_receipt().unwrap();
+                let receipt_result = if failure {
+                    Err("old receipt failure".into())
+                } else {
+                    Ok(matching_receipt(&receipt))
+                };
+                no_command(app.dispatch(Message::ReceiptDone(receipt, receipt_result)));
+                let release = click_release(&mut app);
+                let release_result = if failure {
+                    Err("old release failure".into())
+                } else {
+                    Ok("old version".into())
+                };
+                no_command(app.dispatch(Message::ReleaseDone(release, release_result)));
+                assert!(app.model.release_result.is_some());
+                assert!(app.model.receipt.is_some() || app.model.receipt_error.is_some());
+
+                let original = app.model.root.clone();
+                let generation = app.model.generation.clone();
+                let repository = app.model.repository.clone();
+                let receipt_id = app.model.receipt_id.clone();
+                edit(&mut app, &temp.path().join("new-root"));
+                invalidated(&app);
+                assert_eq!(app.model.root, original);
+                assert!(!Arc::ptr_eq(&generation, &app.model.generation));
+                assert_eq!(app.model.repository, repository);
+                assert_eq!(app.model.receipt_id, receipt_id);
+                assert!(app.root_edited);
+                assert!(app.model.scan.is_none());
+                assert!(!app.model.scan_requested);
+                no_command(app.dispatch(Message::Rescan));
+                no_command(app.dispatch(Message::Select(Product::Retail)));
+                no_command(app.dispatch(Message::CheckRelease));
+                assert_no_release_work(&app.model);
+                drop(app.view());
+            }
+        }
+
+        #[test]
+        fn busy_scan_coalesces_latest_open_and_rejects_foreign_and_duplicate_results() {
+            let (a, _) = receipt_model();
+            let (b, _) = receipt_model();
+            let (c, _) = receipt_model();
+            let (mut app, command) = Preview::new(Flags {
+                root: a.path().into(),
+                native_check: false,
+            });
+            let old_message = local_message(command);
+            let old = match &old_message {
+                Message::InventoryDone(request, _) => request.clone(),
+                other => panic!("Expected scan: {:?}", other),
+            };
+
+            no_command(open(&mut app, b.path()));
+            no_command(open(&mut app, c.path()));
+            invalidated(&app);
+            assert_eq!(app.model.root, c.path());
+            assert!(app.model.scan_requested);
+            owns(app.model.scan.as_ref(), &old.token);
+
+            let mut foreign = old.clone();
+            foreign.token = Arc::new(());
+            no_command(app.dispatch(Message::InventoryDone(foreign, Err("foreign scan".into()))));
+            owns(app.model.scan.as_ref(), &old.token);
+            assert!(app.model.scan_requested);
+
+            let latest_command = app.dispatch(old_message.clone());
+            invalidated(&app);
+            assert!(!app.model.scan_requested);
+            let latest_token = app.model.scan.as_ref().unwrap().clone();
+            assert!(!Arc::ptr_eq(&latest_token, &old.token));
+
+            no_command(app.dispatch(old_message));
+            owns(app.model.scan.as_ref(), &latest_token);
+            let latest_message = local_message(latest_command);
+            match &latest_message {
+                Message::InventoryDone(request, _) => {
+                    assert_eq!(request.root, c.path());
+                    owns(app.model.scan.as_ref(), &request.token);
+                    let mut foreign = request.clone();
+                    foreign.token = Arc::new(());
+                    no_command(app.dispatch(Message::InventoryDone(
+                        foreign,
+                        Err("foreign latest scan".into()),
+                    )));
+                }
+                other => panic!("Expected latest scan: {:?}", other),
+            }
+            owns(app.model.scan.as_ref(), &latest_token);
+            no_command(app.dispatch(latest_message.clone()));
+            let published = app.model.inventory.as_ref().unwrap().clone();
+            assert_eq!(published.root, c.path().canonicalize().unwrap());
+            assert_eq!(app.choices.len(), 2);
+            assert!(app.model.selected.is_none());
+            no_command(app.dispatch(latest_message));
+            assert!(Arc::ptr_eq(
+                app.model.inventory.as_ref().unwrap(),
+                &published
+            ));
+            assert_no_release_work(&app.model);
+        }
+
+        #[test]
+        fn draft_away_back_aba_rejects_scan_even_without_a_queued_open() {
+            let (a, _) = receipt_model();
+            let (b, _) = receipt_model();
+            let (mut app, command) = Preview::new(Flags {
+                root: a.path().into(),
+                native_check: false,
+            });
+            let message = local_message(command);
+            let old_generation = app.model.generation.clone();
+
+            edit(&mut app, b.path());
+            edit(&mut app, a.path());
+            assert_eq!(app.model.root, a.path());
+            assert!(!app.model.scan_requested);
+            assert!(!Arc::ptr_eq(&old_generation, &app.model.generation));
+            no_command(app.dispatch(message.clone()));
+            invalidated(&app);
+            assert!(app.model.scan.is_none());
+            no_command(app.dispatch(message));
+            invalidated(&app);
+
+            let command = app.dispatch(Message::OpenRoot);
+            finish_local(&mut app, command);
+            assert_eq!(
+                app.model.inventory.as_ref().unwrap().root,
+                a.path().canonicalize().unwrap()
+            );
+            assert!(app.model.selected.is_none());
+            assert_no_release_work(&app.model);
+        }
+
+        #[test]
+        fn receipt_holds_shared_slot_until_matching_completion_then_latest_root_scans() {
+            let (_a, model) = release_fixture();
+            let (b, _) = receipt_model();
+            let (c, _) = receipt_model();
+            let mut app = Preview::from_model(model, false);
+            let receipt_command = app.dispatch(Message::InspectReceipt);
+            let old = app.model.pending_receipt.as_ref().unwrap().clone();
+
+            no_command(open(&mut app, b.path()));
+            no_command(open(&mut app, c.path()));
+            invalidated(&app);
+            owns(app.model.receipt_worker.as_ref(), &old.token);
+            assert!(app.model.scan.is_none());
+            assert!(app.model.scan_requested);
+            no_command(app.dispatch(Message::InspectReceipt));
+            no_command(app.dispatch(Message::CheckRelease));
+
+            let mut foreign = old.clone();
+            foreign.token = Arc::new(());
+            no_command(app.dispatch(Message::ReceiptDone(foreign, Err("foreign receipt".into()))));
+            owns(app.model.receipt_worker.as_ref(), &old.token);
+            assert!(app.model.scan.is_none());
+
+            let message = local_message(receipt_command);
+            let scan = app.dispatch(message.clone());
+            assert!(app.model.receipt_worker.is_none());
+            assert!(app.model.receipt.is_none());
+            assert!(app.model.receipt_error.is_none());
+            let scan_token = app.model.scan.as_ref().unwrap().clone();
+            no_command(app.dispatch(message));
+            owns(app.model.scan.as_ref(), &scan_token);
+            finish_local(&mut app, scan);
+            assert_eq!(
+                app.model.inventory.as_ref().unwrap().root,
+                c.path().canonicalize().unwrap()
+            );
+
+            no_command(app.dispatch(Message::Select(Product::Retail)));
+            let current_command = app.dispatch(Message::InspectReceipt);
+            let current = app.model.pending_receipt.as_ref().unwrap().clone();
+            no_command(app.dispatch(Message::ReceiptDone(
+                old.clone(),
+                Ok(matching_receipt(&old)),
+            )));
+            owns(app.model.receipt_worker.as_ref(), &current.token);
+            assert!(app
+                .model
+                .pending_receipt
+                .as_ref()
+                .is_some_and(|pending| Arc::ptr_eq(&pending.token, &current.token)));
+            finish_local(&mut app, current_command);
+            assert!(app.model.receipt.is_none());
+            assert!(app.model.receipt_error.is_some());
+            assert_no_release_work(&app.model);
+        }
+
+        #[test]
+        fn provider_reservation_survives_root_aba_and_only_manual_click_readmits() {
+            let (a, model) = release_fixture();
+            let (b, _) = receipt_model();
+            let mut app = Preview::from_model(model, false);
+            let old = click_release(&mut app);
+
+            for root in [b.path(), a.path()] {
+                let command = open(&mut app, root);
+                owns(app.model.release_worker.as_ref(), &old.token);
+                assert!(app.model.pending_release.is_none());
+                finish_local(&mut app, command);
+                no_command(app.dispatch(Message::Select(Product::Retail)));
+                no_command(app.dispatch(Message::CheckRelease));
+                owns(app.model.release_worker.as_ref(), &old.token);
+            }
+            assert_eq!(app.model.root, old.root);
+            assert_eq!(app.model.selected, Some(old.product));
+            assert!(!Arc::ptr_eq(
+                app.model.inventory.as_ref().unwrap(),
+                &old.inventory
+            ));
+
+            let mut foreign = old.clone();
+            foreign.token = Arc::new(());
+            no_command(app.dispatch(Message::ReleaseDone(foreign, Ok("foreign".into()))));
+            owns(app.model.release_worker.as_ref(), &old.token);
+            no_command(app.dispatch(Message::ReleaseDone(old.clone(), Ok("stale ABA".into()))));
+            assert_no_release_work(&app.model);
+
+            drop(app.view());
+            no_command(app.dispatch(Message::RepositoryChanged(old.repository.clone())));
+            no_command(app.dispatch(Message::ReceiptIdChanged("b".repeat(64))));
+            assert_no_release_work(&app.model);
+            let current = click_release(&mut app);
+            no_command(app.dispatch(Message::ReleaseRateLimited(old, RetryDeadline::Blocked)));
+            owns(app.model.release_worker.as_ref(), &current.token);
+            assert!(app.model.release_retry_at.is_none());
+            no_command(app.dispatch(Message::CheckRelease));
+            no_command(app.dispatch(Message::NativeCheckDone));
+            owns(app.model.release_worker.as_ref(), &current.token);
+            no_command(app.dispatch(Message::ReleaseDone(current.clone(), Ok("current".into()))));
+            no_command(app.dispatch(Message::ReleaseDone(current, Err("duplicate".into()))));
+            assert_eq!(
+                app.model
+                    .release_result
+                    .as_ref()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .version,
+                "current"
+            );
+        }
+
+        #[test]
+        fn stale_rate_completion_preserves_finite_or_blocked_wait_across_root_flow() {
+            let finite = RetryDeadline::from_wait(Instant::now(), Duration::from_secs(172_800));
+            for deadline in [finite, RetryDeadline::Blocked] {
+                let (a, model) = release_fixture();
+                let (b, _) = receipt_model();
+                let (c, _) = receipt_model();
+                let roots = [a.path(), b.path(), c.path()];
+                let before: Vec<_> = roots.iter().map(|root| tree(root)).collect();
+                let mut app = Preview::from_model(model, false);
+                let old = click_release(&mut app);
+                let scan_b = open(&mut app, b.path());
+                owns(app.model.release_worker.as_ref(), &old.token);
+                assert!(app.model.pending_release.is_none());
+
+                let mut foreign = old.clone();
+                foreign.token = Arc::new(());
+                no_command(
+                    app.dispatch(Message::ReleaseRateLimited(foreign, RetryDeadline::Blocked)),
+                );
+                owns(app.model.release_worker.as_ref(), &old.token);
+                assert!(app.model.release_retry_at.is_none());
+
+                no_command(app.dispatch(Message::ReleaseRateLimited(old.clone(), deadline)));
+                assert!(app.model.release_worker.is_none());
+                assert!(app.model.release_result.is_none());
+                assert_eq!(app.model.release_retry_at, Some(deadline));
+
+                no_command(open(&mut app, c.path()));
+                assert_eq!(app.model.release_retry_at, Some(deadline));
+                no_command(app.dispatch(Message::ReleaseRateLimited(
+                    old.clone(),
+                    RetryDeadline::Blocked,
+                )));
+                assert_eq!(app.model.release_retry_at, Some(deadline));
+
+                let scan_c = app.dispatch(local_message(scan_b));
+                assert!(app.model.inventory.is_none());
+                assert_eq!(app.model.root, c.path());
+                finish_local(&mut app, scan_c);
+                no_command(app.dispatch(Message::Select(Product::Retail)));
+                no_command(app.dispatch(Message::CheckRelease));
+                assert_no_release_work(&app.model);
+
+                let command = open(&mut app, a.path());
+                assert_eq!(app.model.release_retry_at, Some(deadline));
+                finish_local(&mut app, command);
+                no_command(app.dispatch(Message::Select(Product::Retail)));
+                no_command(app.dispatch(Message::CheckRelease));
+                no_command(app.dispatch(Message::ReleaseDone(old, Ok("late success".into()))));
+                assert_no_release_work(&app.model);
+
+                no_command(app.dispatch(Message::RootInputChanged(String::new())));
+                assert_eq!(app.model.release_retry_at, Some(deadline));
+                no_command(app.dispatch(Message::OpenRoot));
+                assert!(app.model.error.is_some());
+                assert!(app.model.scan.is_none());
+                assert_eq!(app.model.release_retry_at, Some(deadline));
+                assert_no_release_work(&app.model);
+                for (root, bytes) in roots.iter().zip(&before) {
+                    assert_eq!(&tree(root), bytes);
+                }
             }
         }
     }

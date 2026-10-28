@@ -41,9 +41,21 @@ pub fn main() {
     // an error message anyway and this value won't matter. If it's not an error,
     // the underlying `command` will drive this variable. If a `command` is passed
     // on the command line, Ajour functions as a CLI instead of launching the GUI.
+    // Modified 2026-10-28; original license and attribution apply.
+    // Attach the parent console for explicit commands, checks and rejected
+    // legacy GUI options. Ordinary desktop startup stays windowed.
     let is_cli = opts_result
         .as_ref()
-        .map(|o| o.command.is_some() || o.preview.is_some())
+        .map(|o| {
+            o.command.is_some()
+                || o.preview.is_some()
+                || o.preview_check
+                || o.preview_window_check
+                || o.startup_check
+                || o.data_directory.is_some()
+                || o.self_update_temp.is_some()
+                || !cfg!(feature = "no-self-update")
+        })
         .unwrap_or(false);
 
     // This function validates whether or not we need to exit and print any message
@@ -52,8 +64,10 @@ pub fn main() {
     // fix that allows us to print to the console when not using the GUI.
     let opts = cli::validate_opts_or_exit(opts_result, is_cli, is_debug);
 
-    // Preview exits this branch before configuration, logs, self-update cleanup, tray or providers.
-    if opts.preview.is_some() {
+    // Modified 2026-10-28; original license and attribution apply.
+    // Every no-subcommand launch returns here before any legacy side effect.
+    // Preview/check options with an explicit command are rejected here too.
+    if opts.uses_safe_startup() {
         if let Err(error) = inventory_preview::run(&opts) {
             eprintln!("Patchloom preview: {}", error);
             std::process::exit(1);
