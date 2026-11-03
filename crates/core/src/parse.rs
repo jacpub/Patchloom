@@ -1158,6 +1158,41 @@ fn split_dependencies_into_vec(value: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn regex_upgrade_preserves_toc_metadata_without_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let toc = temp.path().join("Fixture.toc");
+        let contents = "## Title: |cff00ff00Über Addon|r\n## Author: José\n## Notes: Text: with colon\n## Version: 2.3\n## Dependencies: Core, Library\n## X-Curse-Project-ID: 123\nmain.lua\n";
+        std::fs::write(&toc, contents).unwrap();
+        let addon = super::parse_toc_path(&toc).unwrap();
+        assert_eq!(addon.title, "Über Addon");
+        assert_eq!(addon.author.as_deref(), Some("José"));
+        assert_eq!(addon.notes.as_deref(), Some("Text: with colon"));
+        assert_eq!(addon.version.as_deref(), Some("2.3"));
+        assert_eq!(addon.dependencies, ["Core", "Library"]);
+        assert_eq!(addon.repository_identifiers.curse, Some(123));
+        assert_eq!(std::fs::read_to_string(&toc).unwrap(), contents);
+    }
+
+    #[test]
+    fn regex_upgrade_preserves_include_pattern_boundaries() {
+        let patterns = &super::RE_PARSING_PATTERNS;
+        let (_, xml) = &patterns.file_parsing_regex[".xml"];
+        assert!(xml.is_match("<Include file='Frames.xml'/>").unwrap());
+        assert!(!xml.is_match("<Script file='../escape.lua'/>").unwrap());
+        let (_, toc) = &patterns.file_parsing_regex[".toc"];
+        assert!(toc.is_match("  Widgets.lua\n").unwrap());
+        assert!(!toc.is_match("../escape.lua").unwrap());
+        assert!(patterns
+            .initial_inclusion_regex
+            .is_match("Fixture/Fixture_mainline.toc")
+            .unwrap());
+        assert!(!patterns
+            .initial_inclusion_regex
+            .is_match("Fixture/Other.toc")
+            .unwrap());
+    }
+
+    #[test]
     fn unreadable_toc_line_rejects_partial_metadata() {
         let temp = tempfile::tempdir().unwrap();
         let toc = temp.path().join("Fixture.toc");

@@ -318,6 +318,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn regex_upgrade_preserves_description_cleanup() {
+        assert_eq!(
+            regex_html_tags_to_newline().replace_all("One<br/>Two<br />三", "\n"),
+            "One\nTwo\n三"
+        );
+        assert_eq!(
+            regex_html_tags_to_space().replace_all("<b>Über</b>&amp;三", " "),
+            " Über  三"
+        );
+    }
+
+    #[test]
     fn test_wow_path_resolution() {
         let classic_addon_path =
             PathBuf::from(r"/Applications/World of Warcraft/_classic_/Interface/Addons");
