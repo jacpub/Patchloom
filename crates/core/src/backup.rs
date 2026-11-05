@@ -145,6 +145,7 @@ mod chrono_compatibility_tests {
             std::fs::create_dir(&output).unwrap();
             let original = b"fixture addon bytes\n";
             std::fs::write(source.join("Fixture.lua"), original).unwrap();
+            let before = Local::now().naive_local() - chrono::Duration::seconds(2);
             let as_of = backup_folders(
                 vec![BackupFolder::new(&source, fixture.path())],
                 output.clone(),
@@ -153,6 +154,7 @@ mod chrono_compatibility_tests {
             )
             .await
             .unwrap();
+            let after = Local::now().naive_local();
             assert_eq!(latest_backup(output.clone()).await, Some(as_of));
             let archive_path = std::fs::read_dir(&output)
                 .unwrap()
@@ -174,6 +176,22 @@ mod chrono_compatibility_tests {
                 timestamp.day().into()
             )
             .is_some());
+            let calendar = chrono::NaiveDate::from_ymd_opt(
+                timestamp.year().into(),
+                timestamp.month().into(),
+                timestamp.day().into(),
+            )
+            .unwrap()
+            .and_hms_opt(
+                timestamp.hour().into(),
+                timestamp.minute().into(),
+                timestamp.second().into(),
+            )
+            .unwrap();
+            assert!(
+                calendar >= before && calendar <= after,
+                "ZIP must retain the current local backup time"
+            );
             let mut bytes = Vec::new();
             entry.read_to_end(&mut bytes).unwrap();
             assert_eq!(bytes, original);
