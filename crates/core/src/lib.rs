@@ -3,6 +3,7 @@ pub mod backup;
 pub mod cache;
 pub mod catalog;
 pub mod config;
+pub mod curseforge_v1;
 pub mod discovery;
 pub mod error;
 pub mod fs;
