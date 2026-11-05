@@ -26,8 +26,10 @@
 //!
 //! Runtime approval terms, credential handling and provider integration remain
 //! outside this module.
-//! File.fileStatus is not interpreted here; availability and release channel
-//! do not establish moderation status or authorize transport. URLs are screened
+//! Selection conservatively requires File.fileStatus 4 (Approved) or 10
+//! (Released), plus availability and channel. This is metadata, not a trust
+//! guarantee or permission to download. Missing/unknown statuses are ineligible.
+//! URLs are screened
 //! for basic HTTPS syntax only, not DNS, redirect policy or approved CDN hosts.
 //! Hashes are provider claims and are never recomputed by this module.
 
@@ -292,6 +294,7 @@ struct FileMetadata {
     mod_id: u32,
     is_available: bool,
     release_type: u32,
+    file_status: Option<u32>,
     display_name: String,
     file_name: String,
     file_length: u64,
@@ -504,6 +507,7 @@ pub fn select(
 
     let mut eligible = files.into_iter().filter(|file| {
         file.is_available
+            && matches!(file.file_status, Some(4 | 10))
             && file.release_type == channel.number()
             && file
                 .game_versions
@@ -597,6 +601,7 @@ mod tests {
             "modId": MOD,
             "isAvailable": true,
             "releaseType": 1,
+            "fileStatus": 4,
             "displayName": "Synthetic fixture",
             "fileName": "Fixture_Mainline_Classic.zip",
             "fileLength": 123,
@@ -700,8 +705,57 @@ mod tests {
         }
         let mut item = file(1);
         item["fileStatus"] = json!(999);
-        // This layer does not interpret moderation status; a candidate is inert.
-        assert!(matches!(run(vec![item]), Ok(Selection::Candidate(_))));
+        unavailable(run(vec![item]), Unavailable::NoEligibleFile);
+    }
+
+    #[test]
+    fn moderation_status_requires_explicit_approved_or_released() {
+        for status in 0..=24 {
+            let mut item = file(1);
+            item["fileStatus"] = json!(status);
+            if matches!(status, 4 | 10) {
+                assert!(matches!(run(vec![item]), Ok(Selection::Candidate(_))));
+            } else {
+                unavailable(run(vec![item]), Unavailable::NoEligibleFile);
+            }
+        }
+        for value in [json!(null), json!(u32::MAX)] {
+            let mut item = file(1);
+            item["fileStatus"] = value;
+            unavailable(run(vec![item]), Unavailable::NoEligibleFile);
+        }
+        let mut missing = file(1);
+        missing.as_object_mut().unwrap().remove("fileStatus");
+        unavailable(run(vec![missing]), Unavailable::NoEligibleFile);
+        for value in [json!(-1), json!(4294967296_u64), json!("4"), json!(true)] {
+            let mut item = file(1);
+            item["fileStatus"] = value;
+            assert!(matches!(run(vec![item]), Err(Error::MalformedJson)));
+        }
+    }
+
+    #[test]
+    fn approved_status_does_not_override_availability_or_distribution() {
+        for status in [4, 10] {
+            let mut item = file(1);
+            item["fileStatus"] = json!(status);
+            item["isAvailable"] = json!(false);
+            unavailable(run(vec![item.clone()]), Unavailable::NoEligibleFile);
+            item["isAvailable"] = json!(true);
+            let mut value = mod_json();
+            value["data"]["allowModDistribution"] = json!(false);
+            let denied = parse_mod(&serde_json::to_vec(&value).unwrap(), MOD, GAME).unwrap();
+            unavailable(
+                run_with(
+                    &denied,
+                    &compatibility(),
+                    Channel::Stable,
+                    &evidence(),
+                    vec![item],
+                ),
+                Unavailable::DistributionDenied,
+            );
+        }
     }
 
     #[test]
