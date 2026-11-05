@@ -567,26 +567,48 @@ mod tests {
             worker.join().unwrap();
             assert_eq!(fs::read(&dest).unwrap(), b"arrived-during-transfer");
             assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
-            let cancel = temp.path().join("cancel.zip");
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let url = format!("http://{}", listener.local_addr().unwrap());
-            let worker = std::thread::spawn(move || {
-                let mut stream = accept_fixture(&listener);
-                let mut request = [0; 4096];
-                let _ = stream.read(&mut request);
-                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\n");
-                let _ = stream.write_all(&[b'p'; 32768]);
-                std::thread::sleep(Duration::from_millis(250));
-            });
-            assert!(async_std::future::timeout(
-                Duration::from_millis(100),
-                download_verified(&url, &cancel, None, None)
-            )
-            .await
-            .is_err());
-            worker.join().unwrap();
-            assert!(!cancel.exists());
-            assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
+            for signal_ready in [true, false] {
+                let cancel = temp.path().join(format!("cancel-{signal_ready}.zip"));
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let url = format!("http://{}", listener.local_addr().unwrap());
+                let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+                let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+                let worker = std::thread::spawn(move || {
+                    let mut stream = accept_fixture(&listener);
+                    let mut request = [0; 4096];
+                    let _ = stream.read(&mut request);
+                    stream
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\n")
+                        .unwrap();
+                    stream.write_all(&[b'p'; 32768]).unwrap();
+                    if signal_ready {
+                        ready_tx.send(()).unwrap();
+                    }
+                    drop(ready_tx);
+                    release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                });
+                let target = cancel.clone();
+                let transfer = async_std::task::spawn(async move {
+                    download_verified(&url, &target, None, None).await
+                });
+                // Cancel only after the fixture has sent an incomplete body. A
+                // wall-clock delay could cancel before connection under load.
+                let ready = async_std::task::spawn_blocking(move || {
+                    ready_rx.recv_timeout(Duration::from_secs(5))
+                })
+                .await;
+                // Always stop the transfer and join its fixture before checking
+                // readiness, including the deliberately disconnected channel case.
+                let cancelled = transfer.cancel().await;
+                let released = release_tx.send(());
+                let joined = worker.join();
+                assert_eq!(ready.is_ok(), signal_ready);
+                assert!(cancelled.is_none());
+                released.unwrap();
+                joined.unwrap();
+                assert!(!cancel.exists());
+                assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
+            }
         });
     }
     #[test]
