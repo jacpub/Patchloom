@@ -25,7 +25,11 @@ fn address(url: &str) -> Result<Uri, DownloadError> {
         cfg!(test) && uri.scheme_str() == Some("http") && uri.host() == Some("127.0.0.1");
     if (!local_fixture && uri.scheme_str() != Some("https"))
         || uri.host().is_none()
-        || uri.authority().is_some_and(|a| a.as_str().contains('@'))
+        || uri.authority().is_some_and(|a| {
+            a.as_str().contains('@')
+                // Invalid/overflowing explicit ports must not look like an absent port.
+                || (a.as_str().len() > a.host().len() && a.port_u16().is_none())
+        })
     {
         return Err(invalid("Download requires HTTPS without credentials"));
     }
@@ -321,6 +325,102 @@ pub(crate) async fn metadata(url: &str) -> Result<Vec<u8>, DownloadError> {
 mod tests {
     use super::*;
     use std::{io::Read, net::TcpListener};
+
+    // Modified 2026-11-05: offline parser and downloader preflight fixtures.
+    #[test]
+    fn url_idna_rejects_ascii_only_and_empty_punycode_labels() {
+        assert_eq!(
+            url::Url::parse("https://example.org/").unwrap().host_str(),
+            Some("example.org")
+        );
+        for input in ["https://xn--example-.org/", "https://example.org.xn--/"] {
+            assert!(
+                url::Url::parse(input).is_err(),
+                "Malformed label accepted: {}",
+                input
+            );
+            let from = address("https://example.org/").unwrap();
+            assert!(!address(input).is_ok_and(|to| redirect_allowed(&from, &to)));
+        }
+    }
+
+    #[test]
+    fn url_idna_preserves_valid_unicode_and_punycode_identity() {
+        let unicode = url::Url::parse("https://bücher.example:8443/addon?q=1").unwrap();
+        let ascii = url::Url::parse("https://xn--bcher-kva.example:8443/addon?q=1").unwrap();
+        assert_eq!(unicode, ascii);
+        assert_eq!(unicode.host_str(), Some("xn--bcher-kva.example"));
+        assert_eq!(unicode.port(), Some(8443));
+        assert_eq!(unicode.path(), "/addon");
+        assert_eq!(unicode.query(), Some("q=1"));
+        assert!(address("https://bücher.example/addon").is_err());
+    }
+
+    #[test]
+    fn url_idna_redirect_boundaries_do_not_inherit_url_normalization() {
+        let from = address("https://github.com/source").unwrap();
+        for (input, allowed) in [
+            ("https://github.com/next?q=1", true),
+            (
+                "https://release-assets.githubusercontent.com/addon.zip",
+                true,
+            ),
+            ("http://github.com/next", false),
+            ("https://github.com:443/next", false),
+            ("https://github.com:8443/next", false),
+            (
+                "https://release-assets.githubusercontent.com:443/addon.zip",
+                false,
+            ),
+            (
+                "https://release-assets.githubusercontent.com:65536/addon.zip",
+                false,
+            ),
+            (
+                "https://release-assets.githubusercontent.com:invalid/addon.zip",
+                false,
+            ),
+            ("https://github.com.evil.invalid/next", false),
+            (
+                "https://release-assets.githubusercontent.com.evil.invalid/addon.zip",
+                false,
+            ),
+            ("https://xn--github-.com/next", false),
+            ("https://github.com.xn--/next", false),
+            ("https://fixture@github.com/next", false),
+            (
+                "https://fixture:password@release-assets.githubusercontent.com/addon.zip",
+                false,
+            ),
+            ("https://fixture%40github.com/next", false),
+        ] {
+            let admitted = address(input).is_ok_and(|to| redirect_allowed(&from, &to));
+            assert_eq!(admitted, allowed, "{input}");
+        }
+        for input in [
+            "https://[::1]/",
+            "https://[::1]:443/",
+            "https://example.org:8443/",
+        ] {
+            assert!(
+                address(input).is_ok(),
+                "Valid authority rejected: {}",
+                input
+            );
+        }
+        for input in [
+            "https://[::1]:65536/",
+            "https://example.org:/",
+            "https://example.org:invalid/",
+        ] {
+            assert!(
+                address(input).is_err(),
+                "Malformed port accepted: {}",
+                input
+            );
+        }
+    }
+
     fn accept_fixture(listener: &TcpListener) -> std::net::TcpStream {
         listener.set_nonblocking(true).unwrap();
         let start = std::time::Instant::now();
