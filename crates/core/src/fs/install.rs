@@ -320,6 +320,9 @@ fn make_plan(addon: &Addon, root: &Path, incoming: Vec<String>) -> Result<Plan> 
 // No lock file, live journal or recovery action is created by this preflight.
 pub(crate) struct PreparedArchive {
     root: PathBuf,
+    // Keep this handle open: inode/file-index identity may be reused after
+    // closure. Creation timestamps alone can collide on distinct directories.
+    identity: same_file::Handle,
     created: std::time::SystemTime,
     plan: Plan,
     destinations: BTreeMap<String, String>,
@@ -395,6 +398,7 @@ impl PreparedArchive {
         incoming: &[String],
     ) -> Result<()> {
         if recovery_root(root)? != self.root
+            || same_file::Handle::from_path(root)? != self.identity
             || fs::metadata(root)?.created()? != self.created
             || incoming != self.plan.incoming
             || make_plan(addon, root, incoming.to_vec())? != self.plan
@@ -424,6 +428,7 @@ impl PreparedArchive {
 
 pub(crate) fn prepare_archive(addon: &Addon, from: &Path, to: &Path) -> Result<PreparedArchive> {
     let root = recovery_root(to)?;
+    let identity = same_file::Handle::from_path(&root)?;
     require_clean_install(&root)?;
     // Where a cooperative mutex already exists, preflight participates without
     // creating persistent state. Apply always obtains the actual writer lock.
@@ -451,6 +456,7 @@ pub(crate) fn prepare_archive(addon: &Addon, from: &Path, to: &Path) -> Result<P
     let staged = super::ownership::snapshot_paths(&from.join("preview"), &plan.incoming)?;
     let prepared = PreparedArchive {
         root: root.clone(),
+        identity,
         created,
         plan,
         destinations,
@@ -1376,6 +1382,33 @@ mod tests {
             ..Default::default()
         });
         (temp, addon, downloads, root)
+    }
+
+    #[test]
+    fn prepared_archive_rejects_replaced_root_despite_equal_creation_metadata() {
+        let (temp, _old, downloads, root) = fixture();
+        let addon = Addon::empty("package.zip");
+        archive(
+            &downloads.join("package.zip"),
+            &[("Bar/Bar.toc", b"## Interface: 120105")],
+        );
+        let replacement = temp.path().join("different-root");
+        fs::create_dir(&replacement).unwrap();
+        let mut prepared = prepare_archive(&addon, &downloads, &root).unwrap();
+        // Linux CI supplied identical creation times for distinct directories.
+        // Model that exact metadata collision deterministically on every OS;
+        // neither sleeping nor a changed timestamp may be the safety boundary.
+        prepared.created = fs::metadata(&replacement).unwrap().created().unwrap();
+        let originals = approval_tree(&root);
+        let retained = temp.path().join("retained-original-root");
+        fs::rename(&root, &retained).unwrap();
+        fs::rename(&replacement, &root).unwrap();
+        let before = approval_tree(&root);
+        assert!(prepared
+            .validate_destinations(&addon, &root, prepared.incoming())
+            .is_err());
+        assert_eq!(approval_tree(&root), before);
+        assert_eq!(approval_tree(&retained), originals);
     }
 
     #[test]

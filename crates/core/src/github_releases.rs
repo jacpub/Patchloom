@@ -1003,10 +1003,6 @@ mod tests {
             let root = installation.directory.join("Interface/AddOns");
             let replacement = temp.path().join("different-addons-root");
             fs::create_dir(&replacement).unwrap();
-            assert_ne!(
-                fs::metadata(&replacement).unwrap().created().unwrap(),
-                fs::metadata(&root).unwrap().created().unwrap()
-            );
             let bytes = zip(&[("Bar/Bar.toc", "## Interface: 120105\n")]);
             let mut selected = candidate(&installation, &bytes);
             selected.url = server(bytes);
