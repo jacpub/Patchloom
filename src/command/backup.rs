@@ -1,3 +1,4 @@
+// Patchloom lint maintenance, 2026-10-27; original license and attribution apply.
 use crate::cli::BackupFolder;
 use crate::Result;
 
@@ -90,10 +91,8 @@ pub fn backup(
                         src_folders.push(wtf_folder);
                     }
                 }
-                BackupFolder::Screenshots => {
-                    if screenshot_directory.exists() {
-                        src_folders.push(screenshots_folder);
-                    }
+                BackupFolder::Screenshots if screenshot_directory.exists() => {
+                    src_folders.push(screenshots_folder);
                 }
                 _ => {}
             }

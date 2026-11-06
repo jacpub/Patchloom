@@ -1,3 +1,4 @@
+// Patchloom lint maintenance, 2026-10-27; original license and attribution apply.
 use super::{AuraKind, AuraUpdate, Error};
 use async_std::{fs, io::prelude::*, path::Path};
 use std::fmt::Write;
@@ -81,7 +82,7 @@ pub async fn write_updates(
 ) -> Result<Vec<String>, Error> {
     ensure_companion_addon_exists(&addon_dir).await?;
 
-    Ok(CompanionAddon::write_updates(&addon_dir, updates).await?)
+    CompanionAddon::write_updates(&addon_dir, updates).await
 }
 
 /// Only pub for testing. This is called inside `write_updates` and doesn't need

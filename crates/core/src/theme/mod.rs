@@ -1,3 +1,4 @@
+// Patchloom lint maintenance, 2026-10-27; original license and attribution apply.
 use crate::fs;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -475,7 +476,7 @@ impl PartialEq for Theme {
 
 impl PartialOrd for Theme {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.name.cmp(&other.name))
+        Some(self.cmp(other))
     }
 }
 

@@ -1,3 +1,4 @@
+// Patchloom lint maintenance, 2026-10-27; original license and attribution apply.
 use std::{collections::HashMap, convert::TryFrom, fs, path::Path};
 
 use serde::{Deserialize, Serialize};
@@ -41,8 +42,7 @@ pub fn export(
                 flavor,
                 addons
                     .into_iter()
-                    .map(|addon| Data::try_from((flavor, addon)))
-                    .flatten()
+                    .flat_map(|addon| Data::try_from((flavor, addon)))
                     .collect::<Vec<_>>(),
             )
         })

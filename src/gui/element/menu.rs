@@ -1,3 +1,4 @@
+// Patchloom lint maintenance, 2026-10-27; original license and attribution apply.
 use {
     super::{DEFAULT_FONT_SIZE, DEFAULT_PADDING},
     crate::gui::{style, Interaction, Message, Mode, SelfUpdateState, State},
@@ -230,7 +231,7 @@ pub fn data_container<'a>(
         }
     }
 
-    if matches!(myaddons_state, None) {
+    if myaddons_state.is_none() {
         catalog_mode_button =
             catalog_mode_button.style(style::DisabledDefaultButton(color_palette));
         install_mode_button =
@@ -313,7 +314,7 @@ pub fn data_container<'a>(
                 "{} {} -> {}",
                 localized_string("new-update-available"),
                 VERSION,
-                &release.tag_name
+                release.tag_name
             )
         } else {
             VERSION.to_owned()

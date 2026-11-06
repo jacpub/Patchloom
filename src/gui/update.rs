@@ -1,3 +1,4 @@
+// Patchloom lint maintenance, 2026-10-27; original license and attribution apply.
 use {
     super::{
         Ajour, AuraColumnKey, BackupFolderKind, CatalogCategory, CatalogColumnKey, CatalogRow,
@@ -81,7 +82,7 @@ pub fn handle_message(ajour: &mut Ajour, message: Message) -> Result<Command<Mes
             let mut missing_added = 0;
             let mut missing_flavors: Vec<&Flavor> = vec![];
             for flavor in Flavor::ALL.iter() {
-                if ajour.config.wow.directories.get(flavor).is_none() {
+                if !ajour.config.wow.directories.contains_key(flavor) {
                     missing_flavors.push(flavor);
                 }
             }
@@ -170,7 +171,7 @@ pub fn handle_message(ajour: &mut Ajour, message: Message) -> Result<Command<Mes
                 .keys()
                 .collect::<Vec<_>>()
                 .clone();
-            if !flavors.iter().any(|f| *f == &flavor) {
+            if !flavors.contains(&&flavor) {
                 if let Some(flavor) = flavors.first() {
                     ajour.config.wow.flavor = **flavor;
                     ajour.mode = Mode::MyAddons(**flavor);
@@ -629,7 +630,7 @@ pub fn handle_message(ajour: &mut Ajour, message: Message) -> Result<Command<Mes
                 _ => {}
             }
         }
-        Message::CheckRepositoryUpdates(_) => {
+        Message::CheckRepositoryUpdates => {
             log::debug!("Message::CheckRepositoryUpdates");
 
             let mut commands = vec![];
@@ -638,8 +639,7 @@ pub fn handle_message(ajour: &mut Ajour, message: Message) -> Result<Command<Mes
                 if let Some(addons) = ajour.addons.get(flavor) {
                     let repos = addons
                         .iter()
-                        .map(|a| a.repository().cloned())
-                        .flatten()
+                        .filter_map(|a| a.repository().cloned())
                         .collect::<Vec<_>>();
 
                     commands.push(Command::perform(
@@ -1105,14 +1105,9 @@ pub fn handle_message(ajour: &mut Ajour, message: Message) -> Result<Command<Mes
 
             let flavor = ajour.config.wow.flavor;
             let global_release_channel = ajour.config.addons.global_release_channel;
-            let mut addons = ajour.addons.entry(flavor).or_default();
+            let addons = ajour.addons.entry(flavor).or_default();
 
-            sort_addons(
-                &mut addons,
-                global_release_channel,
-                sort_direction,
-                column_key,
-            );
+            sort_addons(addons, global_release_channel, sort_direction, column_key);
 
             ajour.header_state.previous_sort_direction = Some(sort_direction);
             ajour.header_state.previous_column_key = Some(column_key);
@@ -2037,7 +2032,7 @@ pub fn handle_message(ajour: &mut Ajour, message: Message) -> Result<Command<Mes
                 }
             }
         }
-        Message::RefreshCatalog(_) => {
+        Message::RefreshCatalog => {
             if let Some(last_updated) = &ajour.catalog_last_updated {
                 let now = Utc::now();
                 let now_time = now.time();
@@ -2126,7 +2121,7 @@ pub fn handle_message(ajour: &mut Ajour, message: Message) -> Result<Command<Mes
             ajour.config.addons.global_release_channel = channel;
             let _ = ajour.config.save();
         }
-        Message::CheckLatestRelease(_) => {
+        Message::CheckLatestRelease => {
             log::debug!("Message::CheckLatestRelease");
 
             return Ok(Command::perform(
@@ -2767,7 +2762,7 @@ async fn perform_fetch_latest_addon(
         // Needed since id for source install is a URL and this id needs to be safe
         // when using as the temp path of the downloaded zip
         let mut hasher = DefaultHasher::new();
-        hasher.write(format!("{:?}{}", install_kind, &id).as_bytes());
+        hasher.write(format!("{:?}{}", install_kind, id).as_bytes());
         let temp_id = hasher.finish();
 
         let mut addon = Addon::empty(&temp_id.to_string());
@@ -2877,7 +2872,7 @@ fn sort_addons(
 ) {
     match (column_key, sort_direction) {
         (ColumnKey::Title, SortDirection::Asc) => {
-            addons.sort_by(|a, b| a.title().to_lowercase().cmp(&b.title().to_lowercase()));
+            addons.sort_by_key(|a| a.title().to_lowercase());
         }
         (ColumnKey::Title, SortDirection::Desc) => {
             addons.sort_by(|a, b| {
@@ -2971,15 +2966,11 @@ fn sort_addons(
                     .reverse()
             });
         }
-        (ColumnKey::Source, SortDirection::Asc) => {
-            addons.sort_by(|a, b| a.repository_kind().cmp(&b.repository_kind()))
-        }
+        (ColumnKey::Source, SortDirection::Asc) => addons.sort_by_key(|a| a.repository_kind()),
         (ColumnKey::Source, SortDirection::Desc) => {
             addons.sort_by(|a, b| a.repository_kind().cmp(&b.repository_kind()).reverse())
         }
-        (ColumnKey::FuzzyScore, SortDirection::Asc) => {
-            addons.sort_by(|a, b| a.fuzzy_score.cmp(&b.fuzzy_score))
-        }
+        (ColumnKey::FuzzyScore, SortDirection::Asc) => addons.sort_by_key(|a| a.fuzzy_score),
         (ColumnKey::FuzzyScore, SortDirection::Desc) => {
             addons.sort_by(|a, b| a.fuzzy_score.cmp(&b.fuzzy_score).reverse())
         }
@@ -3012,7 +3003,7 @@ fn sort_catalog_addons(
             addons.sort_by(|a, b| a.addon.summary.cmp(&b.addon.summary).reverse());
         }
         (CatalogColumnKey::Source, SortDirection::Asc) => {
-            addons.sort_by(|a, b| a.addon.source.cmp(&b.addon.source));
+            addons.sort_by_key(|a| a.addon.source);
         }
         (CatalogColumnKey::Source, SortDirection::Desc) => {
             addons.sort_by(|a, b| a.addon.source.cmp(&b.addon.source).reverse());
@@ -3040,15 +3031,13 @@ fn sort_catalog_addons(
                 .versions
                 .iter()
                 .find(|v| &v.flavor == flavor)
-                .map(|v| v.date)
-                .flatten();
+                .and_then(|v| v.date);
             let v_b = b
                 .addon
                 .versions
                 .iter()
                 .find(|v| &v.flavor == flavor)
-                .map(|v| v.date)
-                .flatten();
+                .and_then(|v| v.date);
             v_a.cmp(&v_b)
         }),
         (CatalogColumnKey::DateReleased, SortDirection::Desc) => addons.sort_by(|a, b| {
@@ -3057,15 +3046,13 @@ fn sort_catalog_addons(
                 .versions
                 .iter()
                 .find(|v| &v.flavor == flavor)
-                .map(|v| v.date)
-                .flatten();
+                .and_then(|v| v.date);
             let v_b = b
                 .addon
                 .versions
                 .iter()
                 .find(|v| &v.flavor == flavor)
-                .map(|v| v.date)
-                .flatten();
+                .and_then(|v| v.date);
             v_a.cmp(&v_b).reverse()
         }),
         (CatalogColumnKey::GameVersion, SortDirection::Asc) => addons.sort_by(|a, b| {
@@ -3101,7 +3088,7 @@ fn sort_catalog_addons(
 fn sort_auras(auras: &mut [Aura], sort_direction: SortDirection, column_key: AuraColumnKey) {
     match (column_key, sort_direction) {
         (AuraColumnKey::Title, SortDirection::Asc) => {
-            auras.sort_by(|a, b| a.name().to_lowercase().cmp(&b.name().to_lowercase()));
+            auras.sort_by_key(|a| a.name().to_lowercase());
         }
         (AuraColumnKey::Title, SortDirection::Desc) => {
             auras.sort_by(|a, b| {
@@ -3147,7 +3134,7 @@ fn sort_auras(auras: &mut [Aura], sort_direction: SortDirection, column_key: Aur
         (AuraColumnKey::Author, SortDirection::Desc) => {
             auras.sort_by(|a, b| a.author().cmp(b.author()).reverse())
         }
-        (AuraColumnKey::Type, SortDirection::Asc) => auras.sort_by(|a, b| a.kind().cmp(&b.kind())),
+        (AuraColumnKey::Type, SortDirection::Asc) => auras.sort_by_key(|a| a.kind()),
         (AuraColumnKey::Type, SortDirection::Desc) => {
             auras.sort_by(|a, b| a.kind().cmp(&b.kind()).reverse())
         }

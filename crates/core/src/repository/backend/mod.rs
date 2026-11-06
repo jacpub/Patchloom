@@ -1,3 +1,4 @@
+// Patchloom lint maintenance, 2026-10-27; original license and attribution apply.
 use super::RepositoryMetadata;
 use crate::error::RepositoryError;
 
@@ -18,8 +19,10 @@ pub use wowi::WowI;
 
 #[async_trait]
 pub(crate) trait Backend: DynClone + Send + Sync {
+    #[must_use = "Repository requests must be awaited to run"]
     async fn get_metadata(&self) -> Result<RepositoryMetadata, RepositoryError>;
 
+    #[must_use = "Repository requests must be awaited to run"]
     async fn get_changelog(
         &self,
         file_id: Option<i64>,

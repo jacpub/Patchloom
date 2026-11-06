@@ -1,3 +1,4 @@
+// Patchloom lint maintenance, 2026-10-27; original license and attribution apply.
 use crate::config::{Flavor, SelfUpdateChannel};
 use crate::error::DownloadError;
 #[cfg(target_os = "macos")]
@@ -109,7 +110,7 @@ pub async fn download_update_to_temp_file(
     let download_path = current_bin_path
         .parent()
         .unwrap()
-        .join(&format!("tmp_{}", bin_name));
+        .join(format!("tmp_{}", bin_name));
 
     // Path to temporarily force rename current process to, se we can then
     // rename `download_path` to `current_bin_path` and then launch new version
@@ -117,7 +118,7 @@ pub async fn download_update_to_temp_file(
     let tmp_path = current_bin_path
         .parent()
         .unwrap()
-        .join(&format!("tmp2_{}", bin_name));
+        .join(format!("tmp2_{}", bin_name));
 
     // On macos, we actually download an archive with the new binary inside. Let's extract
     // that file and remove the archive.
@@ -264,7 +265,7 @@ where
     })
     .map_err(|e| match e {
         RetryError::Operation { error, .. } => error,
-        RetryError::Internal(message) => io::Error::new(io::ErrorKind::Other, message),
+        RetryError::Internal(message) => io::Error::other(message),
     })
 }
 
@@ -293,7 +294,7 @@ where
     )
     .map_err(|e| match e {
         RetryError::Operation { error, .. } => error,
-        RetryError::Internal(message) => io::Error::new(io::ErrorKind::Other, message),
+        RetryError::Internal(message) => io::Error::other(message),
     })
 }
 
@@ -315,6 +316,18 @@ pub(crate) fn regex_html_tags_to_space() -> Regex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn regex_upgrade_preserves_description_cleanup() {
+        assert_eq!(
+            regex_html_tags_to_newline().replace_all("One<br/>Two<br />三", "\n"),
+            "One\nTwo\n三"
+        );
+        assert_eq!(
+            regex_html_tags_to_space().replace_all("<b>Über</b>&amp;三", " "),
+            " Über  三"
+        );
+    }
 
     #[test]
     fn test_wow_path_resolution() {

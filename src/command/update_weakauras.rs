@@ -1,3 +1,4 @@
+// Patchloom lint maintenance, 2026-10-27; original license and attribution apply.
 use crate::Result;
 
 use ajour_core::config::load_config;
@@ -38,7 +39,7 @@ pub fn update_all_auras() -> Result<()> {
                     .await
                     .context(format!(
                         "{} - Failed to parse WeakAuras for account {}",
-                        flavor, &account
+                        flavor, account
                     ))?;
 
                 if auras.is_empty() {
@@ -50,7 +51,7 @@ pub fn update_all_auras() -> Result<()> {
 
                 let updates = get_aura_updates(&auras).await.context(format!(
                     "{} - Failed to fetch updates for account {}",
-                    flavor, &account
+                    flavor, account
                 ))?;
 
                 if updates.is_empty() {
@@ -62,7 +63,7 @@ pub fn update_all_auras() -> Result<()> {
 
                 let updated_slugs = write_updates(addon_dir, &updates).await.context(format!(
                     "{} - Failed to queue updates for account {}",
-                    flavor, &account
+                    flavor, account
                 ))?;
 
                 log::info!(

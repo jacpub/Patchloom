@@ -1,3 +1,4 @@
+// Patchloom lint maintenance, 2026-10-27; original license and attribution apply.
 use super::*;
 use crate::config::Flavor;
 use crate::error::DownloadError;
@@ -161,7 +162,7 @@ pub(crate) fn metadata_from_fingerprint_info(
 
     let version = Some(info.file.display_name.clone());
     let file_id = Some(info.file.id);
-    let game_version = info.file.game_version.get(0).cloned();
+    let game_version = info.file.game_version.first().cloned();
 
     let mut metadata = RepositoryMetadata::empty();
     metadata.remote_packages = remote_packages;

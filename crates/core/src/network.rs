@@ -13,6 +13,11 @@ use once_cell::sync::Lazy;
 use serde::Serialize;
 use std::path::Path;
 
+mod download;
+pub use download::download_verified;
+pub(crate) use download::metadata;
+pub(crate) use download::plain_directory as plain_download_directory;
+
 /// Shared `HttpClient`.
 static HTTP_CLIENT: Lazy<HttpClient> = Lazy::new(|| {
     HttpClient::builder()
@@ -98,38 +103,17 @@ pub async fn download_addon(
             package.version,
             &addon.primary_folder_id
         );
-        let resp = request_async(package.download_url.clone(), vec![], None).await?;
-        let (parts, mut body) = resp.into_parts();
-
-        // If response length doesn't equal content length, full file wasn't downloaded
-        // so error out
-        {
-            let content_length = parts
-                .headers
-                .get(CONTENT_LENGTH)
-                .map(|v| v.to_str().unwrap_or_default())
-                .unwrap_or_default()
-                .parse::<u64>()
-                .unwrap_or_default();
-
-            let body_length = body.len().unwrap_or_default();
-
-            if body_length != content_length {
-                return Err(DownloadError::ContentLength {
-                    content_length,
-                    body_length,
-                });
-            }
-        }
-
+        crate::fs::validate_component(&addon.primary_folder_id)?;
         if !to_directory.exists() {
+            let ancestor = to_directory
+                .ancestors()
+                .find(|p| p.exists())
+                .ok_or_else(|| std::io::Error::other("No download ancestor"))?;
+            download::plain_directory(ancestor)?;
             create_dir_all(to_directory).await?;
         }
-
         let zip_path = to_directory.join(&addon.primary_folder_id);
-        let mut file = File::create(&zip_path).await?;
-
-        copy(&mut body, &mut file).await?;
+        download_verified(&package.download_url, &zip_path, None, None).await?;
     }
 
     Ok(())

@@ -1,3 +1,4 @@
+// Patchloom lint maintenance, 2026-10-27; original license and attribution apply.
 use crate::config::Flavor;
 use crate::error::DownloadError;
 use crate::network::request_async;
@@ -190,7 +191,7 @@ mod skip_element_unknown_variant {
             }
         }
 
-        deserializer.deserialize_any(SeqVisitor(PhantomData::default()))
+        deserializer.deserialize_any(SeqVisitor(PhantomData))
     }
 }
 
@@ -223,7 +224,7 @@ mod date_parser {
         }
 
         // Handles Elvui and Tukui addons which runs in a format without HH:mm:ss.
-        let s_modified = format!("{} 00:00:00", &s);
+        let s_modified = format!("{} 00:00:00", s);
         let date = NaiveDateTime::parse_from_str(&s_modified, "%Y-%m-%d %T")
             .map(|d| Utc.from_utc_datetime(&d))
             .ok();
@@ -298,7 +299,7 @@ mod tests {
             match idx {
                 _ if idx < 4 => {
                     dbg!(&result);
-                    assert!(result.is_ok());
+                    assert_eq!(result.unwrap().0.len(), if idx < 2 { 0 } else { 2 });
                 }
                 _ => assert!(result.is_err()),
             }
