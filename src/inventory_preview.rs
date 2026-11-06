@@ -1069,6 +1069,7 @@ fn folder_summary(folders: &[String]) -> String {
 
 #[derive(Debug, Clone)]
 enum Message {
+    CloseRequested,
     RootInputChanged(String),
     OpenRoot,
     Select(Product),
@@ -1097,6 +1098,18 @@ enum Message {
 struct Flags {
     root: PathBuf,
     native_check: bool,
+}
+
+// Modified 2026-11-05; native Windows close is owned by Preview, not the shell.
+fn preview_settings(root: PathBuf, native_check: bool, antialiasing: bool) -> Settings<Flags> {
+    let mut settings = Settings::with_flags(Flags { root, native_check });
+    settings.window.size = (960, 680);
+    settings.default_text_size = 16;
+    settings.antialiasing = antialiasing;
+    if cfg!(windows) {
+        settings.exit_on_close_request = false;
+    }
+    settings
 }
 // Added 2026-10-28; original GPLv3 applies.
 // Added 2026-10-28; original GPLv3 applies.
@@ -1455,6 +1468,7 @@ struct Preview {
     scroll: scrollable::State,
     native_check: bool,
     exit: bool,
+    close_requested: bool,
 }
 impl Preview {
     fn from_model(model: Model, native_check: bool) -> Self {
@@ -1475,12 +1489,23 @@ impl Preview {
             scroll: scrollable::State::new(),
             native_check,
             exit: false,
+            close_requested: false,
         };
         app.synchronize_choices();
         app
     }
     // Modified 2026-10-28; original GPLv3 applies.
     fn dispatch(&mut self, message: Message) -> Command<Message> {
+        // Keep only physical recovery completions after close. Queued clicks
+        // cannot start another writer before the shell observes should_exit.
+        if self.close_requested
+            && !matches!(
+                &message,
+                Message::CloseRequested | Message::RecoveryDone(_, _)
+            )
+        {
+            return Command::none();
+        }
         if self.model.restoring()
             && matches!(
                 &message,
@@ -1494,6 +1519,11 @@ impl Preview {
         }
 
         match message {
+            Message::CloseRequested => {
+                self.close_requested = true;
+                self.exit = !self.model.restoring();
+                return Command::none();
+            }
             Message::RootInputChanged(input) => {
                 if self.root_input != input {
                     self.root_input = input;
@@ -1639,6 +1669,12 @@ impl Preview {
                 }
             }
         }
+        if self.close_requested {
+            // Logical publication may be stale, but only a matching physical
+            // completion can release the writer/post-inspection reservation.
+            self.exit = !self.model.restoring();
+            return Command::none();
+        }
         self.model
             .start_scan()
             .map_or_else(Command::none, scan_command)
@@ -1670,11 +1706,20 @@ impl Application for Preview {
         "Patchloom | Inventory preview".into()
     }
     fn subscription(&self) -> Subscription<Message> {
+        let close = iced_native::subscription::events_with(|event, _status| match event {
+            iced_native::Event::Window(iced_native::window::Event::CloseRequested) => {
+                Some(Message::CloseRequested)
+            }
+            _ => None,
+        });
         if self.native_check {
-            iced_futures::time::every(std::time::Duration::from_millis(200))
-                .map(|_| Message::NativeCheckDone)
+            Subscription::batch(vec![
+                close,
+                iced_futures::time::every(std::time::Duration::from_millis(200))
+                    .map(|_| Message::NativeCheckDone),
+            ])
         } else {
-            Subscription::none()
+            close
         }
     }
     fn mode(&self) -> iced::window::Mode {
@@ -1736,6 +1781,10 @@ impl Application for Preview {
             ))
             .push(Row::new().spacing(12).push(root_input).push(open))
             .push(rescan);
+
+        if self.close_requested && restoring {
+            content = content.push(Text::new("Patchloom will close when the restore finishes."));
+        }
 
         if !self.root_edited && !self.model.root.as_os_str().is_empty() {
             content = content.push(
@@ -2103,19 +2152,106 @@ pub fn run(opts: &crate::cli::Opts) -> crate::Result<()> {
         }
         return Ok(());
     }
-    let mut settings = Settings::with_flags(Flags {
+    let settings = preview_settings(
         root,
-        native_check: opts.preview_window_check,
-    });
-    settings.window.size = (960, 680);
-    settings.default_text_size = 16;
-    settings.antialiasing = opts.antialiasing.unwrap_or(false);
+        opts.preview_window_check,
+        opts.antialiasing.unwrap_or(false),
+    );
     Preview::run(settings).map_err(|e| anyhow::anyhow!(e.to_string()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn native_close_messages(
+        app: &Preview,
+        events: Vec<(iced_native::Event, iced_native::event::Status)>,
+    ) -> Vec<Message> {
+        use futures::StreamExt;
+        let mut recipes = app.subscription().recipes();
+        assert_eq!(recipes.len(), 1 + usize::from(app.native_check));
+        async_std::task::block_on(
+            recipes
+                .remove(0)
+                .stream(futures::stream::iter(events).boxed())
+                .collect(),
+        )
+    }
+
+    fn assert_passive_close_subscription(app: &Preview) {
+        assert!(native_close_messages(
+            app,
+            vec![(
+                iced_native::Event::Window(iced_native::window::Event::Focused),
+                iced_native::event::Status::Ignored
+            )]
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn native_close_subscription_delivers_close_events_before_shutdown() {
+        let mut app = Preview::from_model(Model::new(PathBuf::new()), false);
+        let settings = preview_settings(PathBuf::new(), false, false);
+        assert_eq!(settings.exit_on_close_request, !cfg!(windows));
+        assert_eq!(settings.window.size, (960, 680));
+        let messages = native_close_messages(
+            &app,
+            vec![
+                (
+                    iced_native::Event::Window(iced_native::window::Event::Focused),
+                    iced_native::event::Status::Ignored,
+                ),
+                (
+                    iced_native::Event::Window(iced_native::window::Event::CloseRequested),
+                    iced_native::event::Status::Ignored,
+                ),
+                (
+                    iced_native::Event::Window(iced_native::window::Event::CloseRequested),
+                    iced_native::event::Status::Captured,
+                ),
+            ],
+        );
+        assert_eq!(messages.len(), 2);
+        for message in messages {
+            assert!(matches!(&message, Message::CloseRequested));
+            assert!(app.dispatch(message).futures().is_empty());
+            assert!(app.should_exit());
+        }
+        for queued in [
+            Message::Rescan,
+            Message::CheckRelease,
+            Message::InspectRecovery,
+        ] {
+            assert!(app.dispatch(queued).futures().is_empty());
+        }
+        assert!(app.model.recovery_job.is_none());
+        assert!(app.model.release_worker.is_none());
+    }
+
+    #[test]
+    fn native_close_preserves_real_hidden_check_timer() {
+        use futures::StreamExt;
+        let mut app = Preview::from_model(Model::new(PathBuf::new()), true);
+        assert_eq!(app.mode(), iced::window::Mode::Hidden);
+        let mut recipes = app.subscription().recipes();
+        assert_eq!(recipes.len(), 2);
+        let mut timer = recipes
+            .pop()
+            .unwrap()
+            .stream(futures::stream::empty().boxed());
+        let message = async_std::task::block_on(async_std::future::timeout(
+            std::time::Duration::from_secs(2),
+            timer.next(),
+        ))
+        .unwrap()
+        .unwrap();
+        assert!(matches!(&message, Message::NativeCheckDone));
+        assert!(app.dispatch(message).futures().is_empty());
+        assert!(app.should_exit());
+    }
+
     fn deliver(model: &mut Model, command: Command<Message>) -> bool {
         let mut futures = command.futures();
         assert_eq!(futures.len(), 1);
@@ -2162,7 +2298,7 @@ mod tests {
         assert!(app.model.inventory.is_none());
         assert!(app.model.scan.is_some());
         assert_eq!(command.futures().len(), 1);
-        assert!(app.subscription().recipes().is_empty());
+        assert_passive_close_subscription(&app);
     }
 
     #[test]
@@ -2174,7 +2310,7 @@ mod tests {
         let info = temp.path().join(".build.info");
         std::fs::write(&info,"Active!DEC:1|Product!STRING:0|Version!STRING:0\n1|wow|12.1.5.70575\n1|wow_classic|5.5.4.70579\n").unwrap();
         let mut app = scanned_preview(temp.path().into(), false);
-        assert!(app.subscription().recipes().is_empty());
+        assert_passive_close_subscription(&app);
         assert!(!app.model.needs_review());
         assert!(app.model.installation().is_none());
         app.model.select(Product::ClassicProgression);
@@ -2199,7 +2335,7 @@ mod tests {
         assert!(app.model.installation().is_none());
         assert!(app.choices.is_empty());
         drop(app.view());
-        assert!(app.subscription().recipes().is_empty());
+        assert_passive_close_subscription(&app);
         let (smoke, command) = Preview::new(Flags {
             root: temp.path().into(),
             native_check: true,
@@ -3359,7 +3495,7 @@ mod tests {
                         assert!(app.model.pending_release.is_none());
                     }
                     drop(app.view());
-                    assert!(app.subscription().recipes().is_empty());
+                    assert_passive_close_subscription(&app);
                     let report = serde_json::to_value(&app.model).unwrap();
                     assert!(report.get("release_retry_at").is_none());
                 }
@@ -3498,7 +3634,7 @@ mod tests {
             // This deliberately does not claim a real two-day clock advance.
             app.model.release_retry_at = Some(RetryDeadline::At(Instant::now()));
             drop(app.view());
-            assert!(app.subscription().recipes().is_empty());
+            assert_passive_close_subscription(&app);
             let repository = app.model.repository.clone();
             no_command(app.dispatch(Message::RepositoryChanged(repository)));
             assert!(app.model.release_worker.is_none());
@@ -3521,7 +3657,7 @@ mod tests {
         fn native_timer_messages_never_schedule_or_release_provider_work() {
             for state in 0..4 {
                 let (_temp, mut app) = app_fixture();
-                assert!(app.subscription().recipes().is_empty());
+                assert_passive_close_subscription(&app);
                 let request = click_once(&mut app);
                 match state {
                     0 => {
@@ -3555,7 +3691,7 @@ mod tests {
                 let worker = app.model.release_worker.clone();
                 let pending = app.model.pending_release.clone();
                 app.native_check = true;
-                assert!(!app.subscription().recipes().is_empty());
+                assert_passive_close_subscription(&app);
 
                 for _ in 0..3 {
                     no_command(app.dispatch(Message::NativeCheckDone));
@@ -3842,7 +3978,7 @@ mod tests {
 
             // Construction, rendering and the native-check message do not recover.
             assert!(app.model.recovery_job.is_none());
-            assert!(app.subscription().recipes().is_empty());
+            assert_passive_close_subscription(&app);
             drop(app.view());
             no_command(app.dispatch(Message::NativeCheckDone));
             assert!(app.model.recovery_job.is_none());
@@ -4728,6 +4864,171 @@ mod tests {
             }
         }
 
+        #[test]
+        fn native_close_discards_preview_and_does_not_wait_for_read_only_checks() {
+            for cancel_preview in [false, true] {
+                let (wow, data, mut app, _) = fixture(true);
+                let before = tree(wow.path());
+                let config_before = tree(data.path());
+                let preview = plan(&mut app);
+                if cancel_preview {
+                    no_command(app.dispatch(Message::CancelRecoveryPreview(preview.clone())));
+                }
+                app.model.set_repository("fixture/Addon".into());
+                let check = app.model.begin_release().unwrap(); // No HTTP future is executed.
+                let close = native_close_messages(
+                    &app,
+                    vec![(
+                        iced_native::Event::Window(iced_native::window::Event::CloseRequested),
+                        iced_native::event::Status::Ignored,
+                    )],
+                )
+                .pop()
+                .unwrap();
+                no_command(app.dispatch(close));
+                assert!(app.should_exit());
+                for queued in [
+                    Message::RestoreRecovery(preview.clone()),
+                    Message::CheckRelease,
+                    Message::Rescan,
+                    Message::ReleaseDone(check.clone(), Ok("late version".into())),
+                ] {
+                    no_command(app.dispatch(queued));
+                }
+                assert!(app.model.recovery_job.is_none());
+                assert!(app.model.release_result.is_none());
+                assert_eq!(tree(wow.path()), before);
+                assert_eq!(tree(data.path()), config_before);
+            }
+        }
+
+        #[test]
+        fn native_close_drains_only_matching_restore_and_blocks_queued_interactions() {
+            for failure in 0..3 {
+                for stale_display in [false, true] {
+                    let (wow, data, mut app, addons) = fixture(true);
+                    let preview = plan(&mut app);
+                    let command = restore(&mut app, &preview);
+                    let request = app.model.pending_recovery.as_ref().unwrap().clone();
+                    if failure == 1 {
+                        // Preserve the original elsewhere in this fixture while
+                        // making the approved backup unavailable to recovery.
+                        fs::rename(
+                            addons.join(".patchloom-install/backup/Foo"),
+                            wow.path().join("preserved-original-for-error"),
+                        )
+                        .unwrap();
+                    }
+                    let before = tree(wow.path());
+                    let config_before = tree(data.path());
+                    let input = app.root_input.clone();
+                    let repository = app.model.repository.clone();
+                    let receipt_id = app.model.receipt_id.clone();
+                    let close = native_close_messages(
+                        &app,
+                        vec![(
+                            iced_native::Event::Window(iced_native::window::Event::CloseRequested),
+                            iced_native::event::Status::Captured,
+                        )],
+                    )
+                    .pop()
+                    .unwrap();
+                    no_command(app.dispatch(close));
+                    no_command(app.dispatch(Message::CloseRequested));
+                    assert!(!app.should_exit());
+                    owns(&app, &request);
+                    drop(app.view());
+                    for queued in [
+                        Message::RootInputChanged("ignored-after-close".into()),
+                        Message::OpenRoot,
+                        Message::Select(Product::ClassicEra),
+                        Message::Rescan,
+                        Message::RepositoryChanged("ignored/Repository".into()),
+                        Message::CheckRelease,
+                        Message::ReceiptIdChanged("ignored".into()),
+                        Message::InspectReceipt,
+                        Message::InspectRecovery,
+                        Message::PreviewRecovery,
+                        Message::CancelRecoveryPreview(preview.clone()),
+                        Message::RecoveryAckChanged(preview.clone(), "RESTORE".into()),
+                        Message::RestoreRecovery(preview.clone()),
+                        Message::NativeCheckDone,
+                    ] {
+                        no_command(app.dispatch(queued));
+                        owns(&app, &request);
+                        assert!(!app.should_exit());
+                    }
+                    assert_eq!(app.root_input, input);
+                    assert_eq!(app.model.repository, repository);
+                    assert_eq!(app.model.receipt_id, receipt_id);
+                    assert_eq!(tree(wow.path()), before);
+
+                    let mut foreign = request.clone();
+                    foreign.token = Arc::new(());
+                    no_command(app.dispatch(Message::RecoveryDone(
+                        foreign,
+                        RecoveryResult::Restore {
+                            outcome: Err("foreign".into()),
+                            inspection: Err("foreign".into()),
+                        },
+                    )));
+                    no_command(app.dispatch(Message::RecoveryDone(
+                        request.clone(),
+                        RecoveryResult::Inspection(Err("wrong action".into())),
+                    )));
+                    owns(&app, &request);
+                    assert!(!app.should_exit());
+                    if stale_display {
+                        app.model.pending_recovery = None; // Physical ownership remains valid.
+                    }
+                    // Real queued GUI worker runs checked restore and post-inspection.
+                    let mut message = local_message(command);
+                    if let Message::RecoveryDone(
+                        _,
+                        RecoveryResult::Restore {
+                            outcome,
+                            inspection,
+                        },
+                    ) = &mut message
+                    {
+                        assert_eq!(outcome.is_err(), failure == 1);
+                        if failure == 2 {
+                            *inspection = Err("post-inspection fixture error".into());
+                        }
+                    } else {
+                        panic!("Expected restore completion");
+                    }
+                    no_command(app.dispatch(message.clone()));
+                    assert!(app.should_exit());
+                    assert!(app.model.recovery_job.is_none());
+                    assert!(app.model.receipt_worker.is_none());
+                    assert!(app.model.scan.is_none());
+                    assert_eq!(app.model.recovery_outcome.is_none(), stale_display);
+                    no_command(app.dispatch(message)); // Duplicate completion cannot reopen work.
+                    no_command(app.dispatch(Message::Rescan));
+                    assert!(app.should_exit());
+                    let after = tree(wow.path());
+                    if failure == 1 {
+                        assert_eq!(after, before);
+                    }
+                    for bytes in [
+                        b"original".as_slice(),
+                        b"original-bar",
+                        b"replacement",
+                        b"additional",
+                    ] {
+                        assert!(
+                            after
+                                .values()
+                                .any(|entry| matches!(entry, Entry::File(found) if found == bytes)),
+                            "Version bytes must remain preserved"
+                        );
+                    }
+                    assert_eq!(tree(data.path()), config_before);
+                }
+            }
+        }
+
         fn refuse_restore_scope_changes(app: &mut Preview, preview: &RecoveryPreview) {
             let request = app.model.pending_recovery.as_ref().unwrap().clone();
             let root = app.model.root.clone();
@@ -5533,7 +5834,7 @@ mod tests {
                 let generation = app.model.generation.clone();
                 for _ in 0..3 {
                     drop(app.view());
-                    assert_eq!(app.subscription().recipes().is_empty(), !native_check);
+                    assert_passive_close_subscription(&app);
                     no_command(app.dispatch(Message::InspectRecovery));
                     no_command(app.dispatch(Message::PreviewRecovery));
                     no_command(app.dispatch(Message::NativeCheckDone));
@@ -5621,7 +5922,7 @@ mod tests {
                         .map(|preview| preview.approval.clone());
                     for _ in 0..3 {
                         drop(app.view());
-                        assert_eq!(app.subscription().recipes().is_empty(), !native_check);
+                        assert_passive_close_subscription(&app);
                         no_command(app.dispatch(Message::NativeCheckDone));
                         assert!(app.should_exit());
                         assert_eq!(format!("{:?}", app.model), model_before);
@@ -5759,7 +6060,7 @@ mod tests {
                 assert!(app.model.release_worker.is_none());
                 assert!(!app.model.scan_requested);
                 assert!(app.model.release_retry_at.is_none());
-                assert!(app.subscription().recipes().is_empty());
+                assert_passive_close_subscription(&app);
                 drop(app.view());
 
                 no_command(app.dispatch(Message::CheckRelease));
