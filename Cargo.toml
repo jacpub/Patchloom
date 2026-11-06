@@ -16,6 +16,7 @@ default = ["opengl"]
 wgpu = ["ajour-widgets/wgpu", "iced/wgpu", "iced/default_system_font"]
 opengl = ["ajour-widgets/opengl", "iced/glow", "iced/glow_default_system_font"]
 no-self-update = ["ajour-core/no-self-update"]
+fixture-tests = ["ajour-core/fixture-tests"]
 debug = ["iced/debug"]
 
 [dependencies]

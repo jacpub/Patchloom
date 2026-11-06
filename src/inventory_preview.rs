@@ -9,6 +9,9 @@ use iced::{
 use serde::Serialize;
 use std::{path::PathBuf, sync::Arc, time::Instant};
 
+mod install;
+use install::{InstallControls, InstallMessage, InstallState};
+
 #[derive(Debug, Clone)]
 struct ScanRequest {
     root: PathBuf,
@@ -123,7 +126,7 @@ impl RetryDeadline {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum ReleaseFailure {
     Other(String),
     RateLimited(RetryDeadline),
@@ -146,6 +149,8 @@ fn serialize_inventory<S: serde::Serializer>(
 }
 #[derive(Debug, Serialize)]
 struct Model {
+    #[serde(skip)]
+    install: InstallState,
     root: PathBuf,
     #[serde(skip)]
     generation: Arc<()>,
@@ -201,6 +206,7 @@ struct Model {
 impl Model {
     fn new(root: PathBuf) -> Self {
         Self {
+            install: InstallState::default(),
             root,
             generation: Arc::new(()),
             inventory: None,
@@ -280,6 +286,7 @@ impl Model {
             || self.root.as_os_str().is_empty()
             || self.scan.is_some()
             || self.receipt_worker.is_some()
+            || self.install.has_disposal()
         {
             return None;
         }
@@ -326,11 +333,15 @@ impl Model {
         true
     }
     fn clear_receipt(&mut self) {
+        self.clear_install_preview();
         self.pending_receipt = None;
         self.receipt = None;
         self.receipt_error = None;
     }
     fn set_receipt_id(&mut self, id: String) {
+        if self.restoring() {
+            return;
+        }
         if self.receipt_id != id {
             self.clear_receipt();
             self.receipt_id = id;
@@ -360,7 +371,7 @@ impl Model {
     ) -> bool {
         // Recovery uses this physical slot too. A receipt message cannot
         // complete a recovery job, even if supplied with its token.
-        if self.recovery_job.is_some() {
+        if self.recovery_job.is_some() || self.install.has_job() {
             return false;
         }
         if !self
@@ -453,11 +464,15 @@ impl Model {
 
     // Invalidation never releases physical provider capacity.
     fn clear_release(&mut self) {
+        self.clear_checked_install();
         self.pending_release = None;
         self.release_result = None;
     }
 
     fn set_repository(&mut self, repository: String) {
+        if self.restoring() {
+            return;
+        }
         if self.repository != repository {
             self.clear_release();
             self.repository = repository;
@@ -477,6 +492,7 @@ impl Model {
             && !self.scan_requested
             && !self.restoring()
             && self.release_worker.is_none()
+            && !self.install.occupied()
     }
 
     fn can_check_release(&self) -> bool {
@@ -578,9 +594,11 @@ impl Model {
 
     // Added 2026-10-28; original GPLv3 applies.
     fn restoring(&self) -> bool {
-        self.recovery_job
-            .as_ref()
-            .is_some_and(|job| matches!(&job.action, RecoveryAction::Restore(_)))
+        self.install.writing()
+            || self
+                .recovery_job
+                .as_ref()
+                .is_some_and(|job| matches!(&job.action, RecoveryAction::Restore(_)))
     }
 
     fn clear_recovery(&mut self) {
@@ -953,7 +971,7 @@ fn release_command(request: ReleaseRequest) -> Command<Message> {
                 Some(installation) => {
                     ajour_core::github_releases::check(&request.repository, installation)
                         .await
-                        .map(|candidate| clip(&candidate.version, SOURCE_FIELD_CHARS))
+                        .map(Arc::new)
                         .map_err(release_failure)
                 }
                 None => Err(ReleaseFailure::Other(
@@ -963,7 +981,7 @@ fn release_command(request: ReleaseRequest) -> Command<Message> {
             (request, result)
         },
         |(request, result)| match result {
-            Ok(version) => Message::ReleaseDone(request, Ok(version)),
+            Ok(candidate) => Message::ReleaseCandidateDone(request, candidate),
             Err(ReleaseFailure::Other(error)) => Message::ReleaseDone(request, Err(error)),
             Err(ReleaseFailure::RateLimited(deadline)) => {
                 Message::ReleaseRateLimited(request, deadline)
@@ -1069,6 +1087,7 @@ fn folder_summary(folders: &[String]) -> String {
 
 #[derive(Debug, Clone)]
 enum Message {
+    Install(InstallMessage),
     CloseRequested,
     RootInputChanged(String),
     OpenRoot,
@@ -1084,6 +1103,7 @@ enum Message {
     RepositoryChanged(String),
     CheckRelease,
     ReleaseDone(ReleaseRequest, Result<String, String>),
+    ReleaseCandidateDone(ReleaseRequest, Arc<ajour_core::github_releases::Candidate>),
     ReleaseRateLimited(ReleaseRequest, RetryDeadline),
     InspectRecovery,
     PreviewRecovery,
@@ -1453,6 +1473,7 @@ impl RecoveryControls {
 }
 
 struct Preview {
+    install_controls: InstallControls,
     model: Model,
     root_input: String,
     root_edited: bool,
@@ -1474,6 +1495,7 @@ impl Preview {
     fn from_model(model: Model, native_check: bool) -> Self {
         let root_input = model.root.to_string_lossy().into_owned();
         let mut app = Self {
+            install_controls: InstallControls::new(),
             model,
             root_input,
             root_edited: false,
@@ -1496,12 +1518,23 @@ impl Preview {
     }
     // Modified 2026-10-28; original GPLv3 applies.
     fn dispatch(&mut self, message: Message) -> Command<Message> {
+        self.dispatch_with_prepare(message, install::prepare_command)
+    }
+    // The private command boundary lets headless fixtures substitute only the
+    // download, while the same admission/dispatch/apply code remains exercised.
+    fn dispatch_with_prepare(
+        &mut self,
+        message: Message,
+        prepare: impl FnOnce(install::Request) -> Command<Message>,
+    ) -> Command<Message> {
         // Keep only physical recovery completions after close. Queued clicks
         // cannot start another writer before the shell observes should_exit.
         if self.close_requested
             && !matches!(
                 &message,
-                Message::CloseRequested | Message::RecoveryDone(_, _)
+                Message::CloseRequested
+                    | Message::RecoveryDone(_, _)
+                    | Message::Install(InstallMessage::Done(..))
             )
         {
             return Command::none();
@@ -1513,12 +1546,21 @@ impl Preview {
                     | Message::OpenRoot
                     | Message::Select(_)
                     | Message::Rescan
+                    | Message::ReceiptIdChanged(_)
+                    | Message::RepositoryChanged(_)
             )
         {
             return Command::none();
         }
 
         match message {
+            Message::Install(event) => {
+                if !self.root_edited || event.is_completion() {
+                    if let Some(command) = self.install_message(event, prepare) {
+                        return command;
+                    }
+                }
+            }
             Message::CloseRequested => {
                 self.close_requested = true;
                 self.exit = !self.model.restoring();
@@ -1533,7 +1575,7 @@ impl Preview {
                     self.synchronize_choices();
                 }
                 // Logical invalidation does not release physical capacity.
-                return Command::none();
+                return self.followup_command();
             }
             Message::OpenRoot => {
                 let root = if self.root_edited {
@@ -1546,7 +1588,7 @@ impl Preview {
                 self.recovery.root_page = 0;
                 let request = self.model.begin_scan();
                 self.synchronize_choices();
-                return request.map_or_else(Command::none, scan_command);
+                return request.map_or_else(|| self.followup_command(), scan_command);
             }
             Message::Select(product) => {
                 let selected = self.model.selected;
@@ -1562,7 +1604,7 @@ impl Preview {
                 let request = self.model.begin_scan();
                 self.recovery.root_page = 0;
                 self.synchronize_choices();
-                return request.map_or_else(Command::none, scan_command);
+                return request.map_or_else(|| self.followup_command(), scan_command);
             }
             Message::InventoryDone(request, result) => {
                 if self.model.complete_scan(request, result) {
@@ -1588,6 +1630,9 @@ impl Preview {
             }
             Message::ReleaseDone(request, result) => {
                 self.model.complete_release(request, result);
+            }
+            Message::ReleaseCandidateDone(request, candidate) => {
+                self.model.complete_release_candidate(request, candidate);
             }
             Message::ReleaseRateLimited(request, deadline) => {
                 self.model.complete_release_rate_limited(request, deadline);
@@ -1675,9 +1720,7 @@ impl Preview {
             self.exit = !self.model.restoring();
             return Command::none();
         }
-        self.model
-            .start_scan()
-            .map_or_else(Command::none, scan_command)
+        self.followup_command()
     }
     fn synchronize_choices(&mut self) {
         self.choices = (0..self
@@ -1783,7 +1826,9 @@ impl Application for Preview {
             .push(rescan);
 
         if self.close_requested && restoring {
-            content = content.push(Text::new("Patchloom will close when the restore finishes."));
+            content = content.push(Text::new(
+                "Patchloom will close when the current operation finishes.",
+            ));
         }
 
         if !self.root_edited && !self.model.root.as_os_str().is_empty() {
@@ -2014,6 +2059,7 @@ impl Application for Preview {
         // inventory, but progress, outcome and post-inspection must stay visible.
         // RecoveryControls pages the complete canonical approval root and both
         // complete folder slices. Host summaries above are not approval scope.
+        content = content.push(self.install_controls.view(&self.model, self.root_edited));
         content = content.push(self.recovery.view(&self.model, self.root_edited));
 
         // Reuse existing neutral project surfaces without changing approved art.

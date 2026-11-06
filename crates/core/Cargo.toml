@@ -13,6 +13,7 @@ rust-version = "1.89"
 default = []
 gui = ['iced_native']
 no-self-update = []
+fixture-tests = []
 
 [[bin]]
 name = "fingerprint_addon"

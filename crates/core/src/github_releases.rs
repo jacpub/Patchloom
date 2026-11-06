@@ -382,6 +382,24 @@ impl Candidate {
         receipt_id: Option<&str>,
         cache: &Path,
     ) -> Result<PreparedInstall> {
+        let (installation, addon, ownership, temporary) =
+            self.preparation_inputs(installation, receipt_id, cache)?;
+        network::download_verified(
+            &self.url,
+            &temporary.path().join("archive.zip"),
+            Some(self.size),
+            Some(&self.digest),
+        )
+        .await?;
+        self.finish_preparation(installation, addon, ownership, temporary)
+    }
+
+    fn preparation_inputs(
+        &self,
+        installation: &Installation,
+        receipt_id: Option<&str>,
+        cache: &Path,
+    ) -> Result<PreparationInputs> {
         let installation = validate_installation(self, installation)?;
         let root = installation.directory.join("Interface/AddOns");
         network::plain_download_directory(&root)?;
@@ -406,13 +424,17 @@ impl Candidate {
         let temporary = tempfile::Builder::new()
             .prefix(".patchloom-provider-")
             .tempdir_in(cache)?;
-        network::download_verified(
-            &self.url,
-            &temporary.path().join("archive.zip"),
-            Some(self.size),
-            Some(&self.digest),
-        )
-        .await?;
+        Ok((installation, addon, ownership, temporary))
+    }
+
+    fn finish_preparation(
+        &self,
+        installation: Installation,
+        addon: Addon,
+        ownership: Option<crate::fs::OwnershipPreview>,
+        temporary: tempfile::TempDir,
+    ) -> Result<PreparedInstall> {
+        let root = installation.directory.join("Interface/AddOns");
         let archive = crate::fs::prepare_archive(&addon, temporary.path(), &root)?;
         archive.validate_digest(&self.digest)?;
         discovery::parse_product_tocs(
@@ -555,6 +577,78 @@ impl Candidate {
             folders,
             receipt_id: receipt_id.ok_or_else(|| invalid("Ownership receipt was not prepared"))?,
         })
+    }
+}
+
+type PreparationInputs = (
+    Installation,
+    Addon,
+    Option<crate::fs::OwnershipPreview>,
+    tempfile::TempDir,
+);
+
+/// Debug-only, explicitly opted-in local fixtures for downstream app tests.
+/// No production transport, URL allowlist or credential path is changed.
+#[cfg(all(feature = "fixture-tests", debug_assertions))]
+pub mod fixture_support {
+    use super::*;
+    use sha2::{Digest, Sha256};
+    use std::io::Write;
+
+    pub fn package(
+        installation: &Installation,
+        repository: &str,
+        version: &str,
+        entries: &[(&str, &str)],
+    ) -> Result<(Candidate, Vec<u8>)> {
+        repository_name(repository)?;
+        let mut writer = zip::ZipWriter::new(io::Cursor::new(Vec::new()));
+        for (name, content) in entries {
+            writer.start_file(*name, zip::write::FileOptions::default())?;
+            writer.write_all(content.as_bytes())?;
+        }
+        let bytes = writer.finish()?.into_inner();
+        let release = Release {
+            id: 1,
+            tag_name: version.into(),
+            draft: false,
+            prerelease: false,
+            assets: vec![Asset {
+                id: 2,
+                name: "fixture.zip".into(),
+                state: "uploaded".into(),
+                size: bytes.len() as u64,
+                digest: Some(format!("sha256:{:x}", Sha256::digest(&bytes))),
+                browser_download_url: format!(
+                    "https://github.com/{repository}/releases/download/fixture/fixture.zip"
+                ),
+            }],
+        };
+        let manifest = serde_json::to_vec(
+            &serde_json::json!({"releases":[{"filename":"fixture.zip","nolib":false,"metadata":[{"flavor":flavor(installation.product),"interface":installation.interface}]}]}),
+        )?;
+        Ok((
+            resolve(repository, installation, &release, &manifest)?,
+            bytes,
+        ))
+    }
+
+    /// Substitute only the download boundary; validation, staging, receipt
+    /// checks and opaque content-bound approval remain the real core path.
+    pub fn prepare(
+        candidate: &Candidate,
+        installation: &Installation,
+        receipt: Option<&str>,
+        cache: &Path,
+        bytes: &[u8],
+    ) -> Result<PreparedInstall> {
+        let (installation, addon, ownership, temporary) =
+            candidate.preparation_inputs(installation, receipt, cache)?;
+        if bytes.len() as u64 != candidate.size {
+            return Err(invalid("Fixture artifact size mismatch").into());
+        }
+        std::fs::write(temporary.path().join("archive.zip"), bytes)?;
+        candidate.finish_preparation(installation, addon, ownership, temporary)
     }
 }
 
