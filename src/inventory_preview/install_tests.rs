@@ -2,6 +2,9 @@
 use super::*;
 use std::fs;
 
+#[path = "visible_acceptance.rs"]
+mod acceptance;
+
 #[test]
 fn real_clean_success_has_no_recovery_warning_but_retained_inspection_does() {
     async_std::task::block_on(async {
@@ -72,14 +75,14 @@ fn idle_close_never_admits_a_queued_install_and_last_drop_disposes_only_cache() 
 }
 
 struct Fixture {
-    temp: tempfile::TempDir,
+    temp: Arc<tempfile::TempDir>,
     app: Preview,
     addons: PathBuf,
     cache: PathBuf,
     data: PathBuf,
 }
 async fn fixture() -> Fixture {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = Arc::new(tempfile::tempdir().unwrap());
     let root = temp.path().join("wow");
     let addons = root.join("_retail_/Interface/AddOns");
     fs::create_dir_all(addons.join("Keep")).unwrap();

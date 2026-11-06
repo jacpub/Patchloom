@@ -450,12 +450,24 @@ fn prepare_command_with(
     )
 }
 
-fn apply_command(request: Request, approval: InstallApproval) -> Command<Message> {
+pub(super) fn apply_command(request: Request, approval: InstallApproval) -> Command<Message> {
+    apply_command_with(request, approval, || Ok(()), || {})
+}
+
+// Private worker boundary: fixtures can hold a running worker before apply or
+// before post-inspection. Approval and all real writes still use the core API.
+fn apply_command_with<G>(
+    request: Request,
+    approval: InstallApproval,
+    before_apply: impl FnOnce() -> WorkResult<()> + Send + 'static,
+    before_inspection: impl FnOnce() -> G + Send + 'static,
+) -> Command<Message> {
     Command::perform(
         async move {
             let worker = request.clone();
             let outcome = async_std::task::spawn_blocking(move || {
-                let operation = async_std::task::block_on(approval.apply())
+                let operation = before_apply()
+                    .and_then(|_| async_std::task::block_on(approval.apply()))
                     .and_then(|installed| {
                         if !installed.matches_release(&worker.candidate) {
                             return Err(std::io::Error::other(
@@ -469,6 +481,7 @@ fn apply_command(request: Request, approval: InstallApproval) -> Command<Message
                         })
                     })
                     .map_err(|e| clip(&e.to_string(), ERROR_CHARS));
+                let scope = before_inspection();
                 let inventory = discovery::discover(&worker.root)
                     .map(Arc::new)
                     .map_err(|e| clip(&e.to_string(), ERROR_CHARS));
@@ -480,12 +493,14 @@ fn apply_command(request: Request, approval: InstallApproval) -> Command<Message
                 let recovery = ajour_core::fs::inspect_recovery(&worker.addons)
                     .map(Arc::new)
                     .map_err(|e| clip(&e.to_string(), ERROR_CHARS));
-                Outcome {
+                let outcome = Outcome {
                     operation,
                     inventory,
                     receipt,
                     recovery,
-                }
+                };
+                drop(scope);
+                outcome
             })
             .await;
             (request, ResultMessage::Applied(Arc::new(outcome)))
@@ -508,6 +523,7 @@ impl Preview {
         &mut self,
         message: InstallMessage,
         prepare: impl FnOnce(Request) -> Command<Message>,
+        apply: impl FnOnce(Request, InstallApproval) -> Command<Message>,
     ) -> Option<Command<Message>> {
         match message {
             InstallMessage::Prepare(update) => {
@@ -518,7 +534,7 @@ impl Preview {
             }
             InstallMessage::Apply(request) => {
                 if let Some((r, approval)) = self.model.begin_apply_install(&request) {
-                    return Some(apply_command(r, approval));
+                    return Some(apply(r, approval));
                 }
             }
             InstallMessage::Ack(request, answer)

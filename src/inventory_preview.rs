@@ -1120,15 +1120,13 @@ struct Flags {
     native_check: bool,
 }
 
-// Modified 2026-11-05; native Windows close is owned by Preview, not the shell.
+// Modified 2026-11-06; normal window close is owned by Preview on every platform.
 fn preview_settings(root: PathBuf, native_check: bool, antialiasing: bool) -> Settings<Flags> {
     let mut settings = Settings::with_flags(Flags { root, native_check });
     settings.window.size = (960, 680);
     settings.default_text_size = 16;
     settings.antialiasing = antialiasing;
-    if cfg!(windows) {
-        settings.exit_on_close_request = false;
-    }
+    settings.exit_on_close_request = false;
     settings
 }
 // Added 2026-10-28; original GPLv3 applies.
@@ -1527,6 +1525,17 @@ impl Preview {
         message: Message,
         prepare: impl FnOnce(install::Request) -> Command<Message>,
     ) -> Command<Message> {
+        self.dispatch_with_install_workers(message, prepare, install::apply_command)
+    }
+    fn dispatch_with_install_workers(
+        &mut self,
+        message: Message,
+        prepare: impl FnOnce(install::Request) -> Command<Message>,
+        apply: impl FnOnce(
+            install::Request,
+            ajour_core::github_releases::InstallApproval,
+        ) -> Command<Message>,
+    ) -> Command<Message> {
         // Keep only physical recovery completions after close. Queued clicks
         // cannot start another writer before the shell observes should_exit.
         if self.close_requested
@@ -1556,7 +1565,7 @@ impl Preview {
         match message {
             Message::Install(event) => {
                 if !self.root_edited || event.is_completion() {
-                    if let Some(command) = self.install_message(event, prepare) {
+                    if let Some(command) = self.install_message(event, prepare, apply) {
                         return command;
                     }
                 }
@@ -2240,7 +2249,7 @@ mod tests {
     fn native_close_subscription_delivers_close_events_before_shutdown() {
         let mut app = Preview::from_model(Model::new(PathBuf::new()), false);
         let settings = preview_settings(PathBuf::new(), false, false);
-        assert_eq!(settings.exit_on_close_request, !cfg!(windows));
+        assert!(!settings.exit_on_close_request);
         assert_eq!(settings.window.size, (960, 680));
         let messages = native_close_messages(
             &app,
@@ -2279,6 +2288,10 @@ mod tests {
     #[test]
     fn native_close_preserves_real_hidden_check_timer() {
         use futures::StreamExt;
+        let settings = preview_settings(PathBuf::new(), true, true);
+        assert!(!settings.exit_on_close_request);
+        assert!(settings.flags.native_check);
+        assert!(settings.antialiasing);
         let mut app = Preview::from_model(Model::new(PathBuf::new()), true);
         assert_eq!(app.mode(), iced::window::Mode::Hidden);
         let mut recipes = app.subscription().recipes();
