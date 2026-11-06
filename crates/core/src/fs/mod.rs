@@ -22,6 +22,9 @@ pub use install::{
     inspect_recovery, install_addon, preflight_restore_originals, restore_originals,
     restore_originals_checked, RecoveryApproval, RecoveryInspection, RecoveryRestoreOutcome,
 };
+pub(crate) use install::{
+    install_addon_guarded, prepare_archive, require_clean_install, PreparedArchive,
+};
 pub use ownership::{inspect_ownership, OwnershipPreview};
 pub use save::PersistentData;
 #[cfg(feature = "gui")]
@@ -64,4 +67,4 @@ pub fn config_dir() -> PathBuf {
     config_dir
 }
 
-type Result<T, E = FilesystemError> = std::result::Result<T, E>;
+pub(crate) type Result<T, E = FilesystemError> = std::result::Result<T, E>;

@@ -73,6 +73,184 @@ impl Installed {
     }
 }
 
+/// Exact folder effects of one validated artifact, not authority to adopt addons.
+pub struct InstallPreview {
+    added: Vec<String>,
+    replaced: Vec<String>,
+    removed: Vec<String>,
+}
+impl InstallPreview {
+    pub fn added(&self) -> &[String] {
+        &self.added
+    }
+    pub fn replaced(&self) -> &[String] {
+        &self.replaced
+    }
+    pub fn removed(&self) -> &[String] {
+        &self.removed
+    }
+}
+
+/// Owns temporary verified bytes and an immutable content-bound preview.
+/// Dropping this object cancels without touching installed folders.
+pub struct PreparedInstall {
+    candidate: Candidate,
+    installation: Installation,
+    temporary: tempfile::TempDir,
+    archive: crate::fs::PreparedArchive,
+    addon: Addon,
+    ownership: Option<crate::fs::OwnershipPreview>,
+    preview: InstallPreview,
+}
+
+/// Single-use approval of exactly one prepared artifact and folder snapshot.
+/// Approval and application both consume their input; neither type is Clone.
+/// ```compile_fail
+/// use ajour_core::github_releases::PreparedInstall;
+/// fn duplicate(prepared: PreparedInstall) {
+///     let first = prepared.approve();
+///     let second = prepared.approve();
+/// }
+/// ```
+/// ```compile_fail
+/// use ajour_core::github_releases::InstallApproval;
+/// async fn replay(approval: InstallApproval) {
+///     let first = approval.apply().await;
+///     let second = approval.apply().await;
+/// }
+/// ```
+pub struct InstallApproval(PreparedInstall);
+
+impl PreparedInstall {
+    pub fn preview(&self) -> &InstallPreview {
+        &self.preview
+    }
+    pub fn candidate(&self) -> &Candidate {
+        &self.candidate
+    }
+    /// Call only after the user explicitly confirms this exact preview.
+    pub fn approve(self) -> InstallApproval {
+        InstallApproval(self)
+    }
+
+    fn validate(&self, root: &Path, incoming: &[String]) -> crate::fs::Result<()> {
+        crate::fs::require_clean_install(root)?;
+        self.validate_contents(root, incoming)
+    }
+
+    fn validate_contents(&self, root: &Path, incoming: &[String]) -> crate::fs::Result<()> {
+        validate_installation(&self.candidate, &self.installation)
+            .map_err(|e| invalid(&e.to_string()))?;
+        network::plain_download_directory(root).map_err(|e| invalid(&e.to_string()))?;
+        network::plain_download_directory(self.temporary.path())
+            .map_err(|e| invalid(&e.to_string()))?;
+        self.archive
+            .validate_archive(&self.temporary.path().join("archive.zip"))?;
+        self.archive
+            .validate_staged(&self.temporary.path().join("preview"))?;
+        self.archive
+            .validate_destinations(&self.addon, root, incoming)?;
+        if let Some(expected) = &self.ownership {
+            let current = crate::fs::inspect_ownership(root, &expected.id)?;
+            if current.root != expected.root
+                || current.source != expected.source
+                || current.folders != expected.folders
+            {
+                return Err(invalid("Prepared ownership changed; review again").into());
+            }
+        }
+        Ok(())
+    }
+
+    // Called only while the actual installer holds its writer lock.
+    fn authorize_ownership(&self, root: &Path) -> crate::fs::Result<()> {
+        if let Some(expected) = &self.ownership {
+            let source = serde_json::to_value(&self.candidate).map_err(io::Error::other)?;
+            crate::fs::ownership::authorize(root, &expected.id, &source, |current| {
+                current.id == expected.id
+                    && current.root == expected.root
+                    && current.source == expected.source
+                    && current.folders == expected.folders
+            })?;
+        }
+        Ok(())
+    }
+}
+
+impl InstallApproval {
+    /// Revalidate under the existing installer mutex, then use its transaction.
+    /// Errors after commit can report pending ownership publication/cleanup;
+    /// inspect retained state before retrying rather than assuming rollback.
+    pub async fn apply(self) -> Result<Installed> {
+        let prepared = self.0;
+        let root = prepared.installation.directory.join("Interface/AddOns");
+        // Check plain paths before the shared installer opens the cached ZIP;
+        // repeat all authoritative checks under its actual writer lock below.
+        network::plain_download_directory(prepared.temporary.path())?;
+        prepared
+            .archive
+            .validate_archive(&prepared.temporary.path().join("archive.zip"))?;
+        let source = serde_json::to_value(&prepared.candidate)?;
+        let mut receipt_id = None;
+        let folders = crate::fs::install_addon_guarded(
+            &prepared.addon,
+            prepared.temporary.path(),
+            &root,
+            |root, incoming| {
+                prepared.validate(root, incoming)?;
+                prepared.authorize_ownership(root)
+            },
+            |staged, _| {
+                prepared.validate_contents(&root, prepared.archive.incoming())?;
+                prepared.authorize_ownership(&root)?;
+                prepared.archive.validate_staged(staged)?;
+                let folders = discovery::parse_product_tocs(
+                    staged,
+                    prepared.candidate.product,
+                    prepared.candidate.interface,
+                )?;
+                receipt_id = Some(crate::fs::ownership::prepare(staged, &root, source)?);
+                Ok(folders)
+            },
+        )
+        .await?;
+        Ok(Installed {
+            candidate: prepared.candidate,
+            folders,
+            receipt_id: receipt_id.ok_or_else(|| invalid("Ownership receipt was not prepared"))?,
+        })
+    }
+}
+
+fn validate_installation(
+    candidate: &Candidate,
+    expected: &Installation,
+) -> io::Result<Installation> {
+    network::plain_download_directory(&expected.directory).map_err(|e| invalid(&e.to_string()))?;
+    if expected.product != candidate.product || expected.interface != candidate.interface {
+        return Err(invalid("Candidate/product mismatch"));
+    }
+    let root = expected
+        .directory
+        .parent()
+        .ok_or_else(|| invalid("Missing installation root"))?;
+    let fresh = discovery::discover(root)?;
+    if !fresh.issues.is_empty() {
+        return Err(invalid("Installation discovery is ambiguous"));
+    }
+    fresh
+        .installations
+        .into_iter()
+        .find(|i| {
+            i.product == expected.product
+                && i.product_id == expected.product_id
+                && i.version == expected.version
+                && i.interface == expected.interface
+                && i.directory == expected.directory
+        })
+        .ok_or_else(|| invalid("Installation identity changed; rediscover before updating"))
+}
+
 fn repository_name(repository: &str) -> Result<()> {
     let parts: Vec<_> = repository.split('/').collect();
     if parts.len() != 2
@@ -195,6 +373,87 @@ pub async fn check(repository: &str, installation: &Installation) -> Result<Cand
 }
 
 impl Candidate {
+    /// Prepare a nonconflicting fresh install (`None`) or content-matching
+    /// receipt-backed update. This creates only owned temporary cache files.
+    /// It neither adopts unmanaged folders nor recovers an older transaction.
+    pub async fn prepare(
+        &self,
+        installation: &Installation,
+        receipt_id: Option<&str>,
+        cache: &Path,
+    ) -> Result<PreparedInstall> {
+        let installation = validate_installation(self, installation)?;
+        let root = installation.directory.join("Interface/AddOns");
+        network::plain_download_directory(&root)?;
+        network::plain_download_directory(cache)?;
+        if cache.canonicalize()?.starts_with(
+            installation
+                .directory
+                .parent()
+                .ok_or_else(|| invalid("Missing installation root"))?,
+        ) {
+            return Err(invalid("Preparation cache must be outside the WoW installation").into());
+        }
+        crate::fs::require_clean_install(&root)?;
+        let source = serde_json::to_value(self)?;
+        let mut addon = Addon::empty("archive.zip");
+        let ownership = if let Some(id) = receipt_id {
+            addon.folders = crate::fs::ownership::hints(&root, id, &source)?;
+            Some(crate::fs::inspect_ownership(&root, id)?)
+        } else {
+            None
+        };
+        let temporary = tempfile::Builder::new()
+            .prefix(".patchloom-provider-")
+            .tempdir_in(cache)?;
+        network::download_verified(
+            &self.url,
+            &temporary.path().join("archive.zip"),
+            Some(self.size),
+            Some(&self.digest),
+        )
+        .await?;
+        let archive = crate::fs::prepare_archive(&addon, temporary.path(), &root)?;
+        archive.validate_digest(&self.digest)?;
+        discovery::parse_product_tocs(
+            &temporary.path().join("preview"),
+            self.product,
+            self.interface,
+        )?;
+        let preview = InstallPreview {
+            added: archive
+                .incoming()
+                .iter()
+                .filter(|n| !archive.previous().contains(n))
+                .cloned()
+                .collect(),
+            replaced: archive
+                .incoming()
+                .iter()
+                .filter(|n| archive.previous().contains(n))
+                .cloned()
+                .collect(),
+            removed: archive
+                .previous()
+                .iter()
+                .filter(|n| !archive.incoming().contains(n))
+                .cloned()
+                .collect(),
+        };
+        let prepared = PreparedInstall {
+            candidate: self.clone(),
+            installation,
+            temporary,
+            archive,
+            addon,
+            ownership,
+            preview,
+        };
+        // Validate again after download/staging, without creating a live mutex.
+        prepared.validate(&root, prepared.archive.incoming())?;
+        Ok(prepared)
+    }
+
     /// Caller explicitly supplies previously owned folders; discovery alone never proves ownership.
     /// The returned in-memory receipt is produced only after the installer commits.
     pub async fn install(
@@ -363,6 +622,448 @@ mod tests {
         let release: Release=serde_json::from_value(serde_json::json!({"id":1,"tag_name":"v2","draft":false,"prerelease":false,"assets":[{"id":2,"name":"Foo.zip","state":"uploaded","size":bytes.len(),"digest":format!("sha256:{:x}",Sha256::digest(bytes)),"browser_download_url":"https://github.com/fixture/addon/releases/download/v2/Foo.zip"}]})).unwrap();
         resolve("fixture/addon",installation,&release,br#"{"releases":[{"filename":"Foo.zip","nolib":false,"metadata":[{"flavor":"mainline","interface":120105}]}]}"#).unwrap()
     }
+    #[test]
+    fn prepared_fresh_preview_is_read_only_and_apply_requires_consumed_approval() {
+        async_std::task::block_on(async {
+            let (temp, installation, previous) = fixture();
+            let root = installation.directory.join("Interface/AddOns");
+            let bytes = zip(&[
+                ("Bar/Bar.toc", "## Interface: 120105\n## Version: v2\n"),
+                ("Bar/new.lua", "new"),
+            ]);
+            let mut selected = candidate(&installation, &bytes);
+            selected.url = server(bytes.clone());
+            let prepared = selected
+                .prepare(&installation, None, temp.path())
+                .await
+                .unwrap();
+            assert_eq!(prepared.preview().added(), ["Bar"]);
+            assert!(prepared.preview().replaced().is_empty());
+            assert!(prepared.preview().removed().is_empty());
+            assert!(!root.join("Bar").exists());
+            assert!(!root.join(".patchloom-install.lock").exists());
+            assert!(!root.join(".patchloom-install").exists());
+            drop(prepared);
+            assert!(!root.join("Bar").exists());
+            assert_eq!(
+                fs::read(previous[0].path.join("old.lua")).unwrap(),
+                b"preserve"
+            );
+            selected.url = server(bytes);
+            let installed = selected
+                .prepare(&installation, None, temp.path())
+                .await
+                .unwrap()
+                .approve()
+                .apply()
+                .await
+                .unwrap();
+            assert!(installed.matches_release(&selected));
+            assert_eq!(fs::read(root.join("Bar/new.lua")).unwrap(), b"new");
+            let receipt = crate::fs::inspect_ownership(&root, &installed.receipt_id).unwrap();
+            assert_eq!(receipt.folders, ["Bar"]);
+            assert_eq!(
+                fs::read(previous[0].path.join("old.lua")).unwrap(),
+                b"preserve"
+            );
+        });
+    }
+
+    #[test]
+    fn prepared_update_shows_exact_replacements_additions_and_removals() {
+        async_std::task::block_on(async {
+            let (temp, installation, previous) = fixture();
+            let root = installation.directory.join("Interface/AddOns");
+            let bytes = zip(&[
+                ("Foo/Foo.toc", "## Interface: 120105\n"),
+                ("Gone/Gone.toc", "## Interface: 120105\n"),
+            ]);
+            let mut first = candidate(&installation, &bytes);
+            first.url = server(bytes);
+            let old = first
+                .install(&installation, &previous, temp.path())
+                .await
+                .unwrap();
+            let old_receipt = fs::read(
+                root.join(".patchloom-ownership")
+                    .join(format!("{}.json", old.receipt_id)),
+            )
+            .unwrap();
+            let bytes = zip(&[
+                ("Foo/Foo.toc", "## Interface: 120105\n## Version: v3\n"),
+                ("Added/Added.toc", "## Interface: 120105\n"),
+            ]);
+            let mut next = candidate(&installation, &bytes);
+            next.version = "v3".into();
+            next.url = server(bytes);
+            let prepared = next
+                .prepare(&installation, Some(&old.receipt_id), temp.path())
+                .await
+                .unwrap();
+            assert_eq!(prepared.preview().added(), ["Added"]);
+            assert_eq!(prepared.preview().replaced(), ["Foo"]);
+            assert_eq!(prepared.preview().removed(), ["Gone"]);
+            assert!(root.join("Gone").is_dir());
+            assert!(!root.join("Added").exists());
+            let installed = prepared.approve().apply().await.unwrap();
+            assert!(root.join("Added").is_dir());
+            assert!(!root.join("Gone").exists());
+            assert_eq!(
+                installed
+                    .folders
+                    .iter()
+                    .find(|f| f.id == "Foo")
+                    .unwrap()
+                    .version
+                    .as_deref(),
+                Some("v3")
+            );
+            assert_eq!(
+                fs::read(
+                    root.join(".patchloom-ownership")
+                        .join(format!("{}.json", old.receipt_id))
+                )
+                .unwrap(),
+                old_receipt
+            );
+            assert_eq!(
+                crate::fs::inspect_ownership(&root, &installed.receipt_id)
+                    .unwrap()
+                    .folders,
+                ["Added", "Foo"]
+            );
+        });
+    }
+
+    // Byte/tree preservation oracle excludes only the cooperative mutex created
+    // by an explicit apply; payload files with that name remain included.
+    fn prepared_tree(root: &Path) -> std::collections::BTreeMap<String, String> {
+        walkdir::WalkDir::new(root)
+            .follow_links(false)
+            .into_iter()
+            .map(|e| e.unwrap())
+            .filter(|e| e.path() != root && e.path() != root.join(".patchloom-install.lock"))
+            .map(|e| {
+                let name = e
+                    .path()
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                let m = fs::symlink_metadata(e.path()).unwrap();
+                let value = if m.file_type().is_symlink() {
+                    "link".into()
+                } else if m.is_dir() {
+                    "directory".into()
+                } else {
+                    format!("{:x}", Sha256::digest(fs::read(e.path()).unwrap()))
+                };
+                (name, value)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn prepared_fresh_install_rejects_unmanaged_owned_looking_and_case_collisions() {
+        async_std::task::block_on(async {
+            for name in ["Foo", "foo"] {
+                let (temp, installation, _) = fixture();
+                let root = installation.directory.join("Interface/AddOns");
+                let bytes = zip(&[(
+                    if name == "Foo" {
+                        "Foo/Foo.toc"
+                    } else {
+                        "foo/foo.toc"
+                    },
+                    "## Interface: 120105\n",
+                )]);
+                let mut selected = candidate(&installation, &bytes);
+                selected.url = server(bytes);
+                let before = prepared_tree(&root);
+                assert!(selected
+                    .prepare(&installation, None, temp.path())
+                    .await
+                    .is_err());
+                assert_eq!(prepared_tree(&root), before);
+                assert!(!root.join(".patchloom-install.lock").exists());
+            }
+        });
+    }
+
+    #[test]
+    fn prepared_rejects_unsafe_or_incompatible_archives_without_live_state() {
+        async_std::task::block_on(async {
+            for entries in [
+                vec![("../escape", "bad")],
+                vec![("Bar/Bar.toc", "## Interface: 11509\n")],
+                vec![("Bar/no-toc.lua", "bad")],
+            ] {
+                let (temp, installation, _) = fixture();
+                let root = installation.directory.join("Interface/AddOns");
+                let before = prepared_tree(&root);
+                let bytes = zip(&entries);
+                let mut selected = candidate(&installation, &bytes);
+                selected.url = server(bytes);
+                assert!(selected
+                    .prepare(&installation, None, temp.path())
+                    .await
+                    .is_err());
+                assert_eq!(prepared_tree(&root), before);
+                assert!(!root.join(".patchloom-install.lock").exists());
+                assert!(!temp.path().join("escape").exists());
+            }
+        });
+    }
+
+    #[test]
+    fn prepared_mutations_invalidate_approval_before_replacement() {
+        async_std::task::block_on(async {
+            for mutation in 0..7 {
+                let (temp, installation, previous) = fixture();
+                let root = installation.directory.join("Interface/AddOns");
+                let bytes = zip(&[
+                    ("Foo/Foo.toc", "## Interface: 120105\n"),
+                    ("Foo/value.lua", "old"),
+                ]);
+                let mut first = candidate(&installation, &bytes);
+                first.url = server(bytes);
+                let old = first
+                    .install(&installation, &previous, temp.path())
+                    .await
+                    .unwrap();
+                let bytes = zip(&[
+                    ("Foo/Foo.toc", "## Interface: 120105\n"),
+                    ("Foo/value.lua", "new"),
+                    ("Bar/Bar.toc", "## Interface: 120105\n"),
+                ]);
+                let mut next = candidate(&installation, &bytes);
+                next.url = server(bytes);
+                let prepared = next
+                    .prepare(&installation, Some(&old.receipt_id), temp.path())
+                    .await
+                    .unwrap();
+                let receipt = root
+                    .join(".patchloom-ownership")
+                    .join(format!("{}.json", old.receipt_id));
+                match mutation {
+                    0 => fs::OpenOptions::new()
+                        .append(true)
+                        .open(prepared.temporary.path().join("archive.zip"))
+                        .unwrap()
+                        .write_all(b"changed")
+                        .unwrap(),
+                    1 => fs::write(
+                        prepared.temporary.path().join("preview/Foo/value.lua"),
+                        b"changed",
+                    )
+                    .unwrap(),
+                    2 => fs::write(root.join("Foo/value.lua"), b"user-edited").unwrap(),
+                    3 => {
+                        fs::create_dir(root.join("Bar")).unwrap();
+                        fs::write(root.join("Bar/keep"), b"unmanaged").unwrap();
+                    }
+                    4 => fs::write(
+                        installation.directory.parent().unwrap().join(".build.info"),
+                        "Active!DEC:1|Product!STRING:0|Version!STRING:0\n1|wow|12.2.0.70575\n",
+                    )
+                    .unwrap(),
+                    5 => fs::OpenOptions::new()
+                        .append(true)
+                        .open(&receipt)
+                        .unwrap()
+                        .write_all(b" ")
+                        .unwrap(),
+                    6 => fs::rename(&receipt, temp.path().join("preserved-receipt.json")).unwrap(),
+                    _ => unreachable!(),
+                }
+                let before = prepared_tree(&root);
+                assert!(
+                    prepared.approve().apply().await.is_err(),
+                    "mutation {} was accepted",
+                    mutation
+                );
+                assert_eq!(
+                    prepared_tree(&root),
+                    before,
+                    "mutation {mutation} lost data"
+                );
+                assert!(!root.join(".patchloom-install").exists());
+                assert_eq!(
+                    fs::read(root.join("Foo/value.lua")).unwrap(),
+                    if mutation == 2 {
+                        b"user-edited".as_slice()
+                    } else {
+                        b"old".as_slice()
+                    }
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn prepared_pending_recovery_is_never_implicitly_recovered() {
+        async_std::task::block_on(async {
+            for pending in [".patchloom-install", ".patchloom-restore"] {
+                for before_prepare in [false, true] {
+                    let (temp, installation, _) = fixture();
+                    let root = installation.directory.join("Interface/AddOns");
+                    let bytes = zip(&[("Bar/Bar.toc", "## Interface: 120105\n")]);
+                    let mut selected = candidate(&installation, &bytes);
+                    if before_prepare {
+                        fs::create_dir(root.join(pending)).unwrap();
+                        let before = prepared_tree(&root);
+                        selected.url = "http://127.0.0.1:1/no-request".into();
+                        let error = selected
+                            .prepare(&installation, None, temp.path())
+                            .await
+                            .err()
+                            .unwrap();
+                        assert!(error.to_string().contains("Pending installation"));
+                        assert_eq!(prepared_tree(&root), before);
+                        assert!(!root.join(".patchloom-install.lock").exists());
+                    } else {
+                        selected.url = server(bytes);
+                        let prepared = selected
+                            .prepare(&installation, None, temp.path())
+                            .await
+                            .unwrap();
+                        fs::create_dir(root.join(pending)).unwrap();
+                        let before = prepared_tree(&root);
+                        assert!(prepared.approve().apply().await.is_err());
+                        assert_eq!(prepared_tree(&root), before);
+                        assert!(
+                            root.join(pending).is_dir(),
+                            "empty pending journal must not be recovered/removed"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn prepared_busy_install_lock_blocks_preparation_and_apply() {
+        async_std::task::block_on(async {
+            for before_prepare in [false, true] {
+                let (temp, installation, _) = fixture();
+                let root = installation.directory.join("Interface/AddOns");
+                let bytes = zip(&[("Bar/Bar.toc", "## Interface: 120105\n")]);
+                let mut selected = candidate(&installation, &bytes);
+                selected.url = server(bytes);
+                let prepared = if !before_prepare {
+                    Some(
+                        selected
+                            .prepare(&installation, None, temp.path())
+                            .await
+                            .unwrap(),
+                    )
+                } else {
+                    None
+                };
+                let lock = fs::File::create(root.join(".patchloom-install.lock")).unwrap();
+                lock.try_lock().unwrap();
+                let before = prepared_tree(&root);
+                if let Some(prepared) = prepared {
+                    assert!(prepared.approve().apply().await.is_err());
+                } else {
+                    assert!(selected
+                        .prepare(&installation, None, temp.path())
+                        .await
+                        .is_err());
+                }
+                assert_eq!(prepared_tree(&root), before);
+                assert!(!root.join(".patchloom-install").exists());
+            }
+        });
+    }
+
+    #[test]
+    fn prepared_cache_inside_installation_is_rejected_without_download_or_writes() {
+        async_std::task::block_on(async {
+            let (_temp, installation, _) = fixture();
+            let root = installation.directory.join("Interface/AddOns");
+            let before = prepared_tree(&root);
+            let bytes = zip(&[("Bar/Bar.toc", "## Interface: 120105\n")]);
+            let mut selected = candidate(&installation, &bytes);
+            selected.url = "http://127.0.0.1:1/no-request".into();
+            let error = selected
+                .prepare(&installation, None, &root)
+                .await
+                .err()
+                .unwrap();
+            assert!(error.to_string().contains("cache must be outside"));
+            assert_eq!(prepared_tree(&root), before);
+        });
+    }
+
+    #[test]
+    fn prepared_root_replacement_invalidates_a_fresh_install_even_when_affected_names_are_absent() {
+        async_std::task::block_on(async {
+            let (temp, installation, _) = fixture();
+            let root = installation.directory.join("Interface/AddOns");
+            let replacement = temp.path().join("different-addons-root");
+            fs::create_dir(&replacement).unwrap();
+            assert_ne!(
+                fs::metadata(&replacement).unwrap().created().unwrap(),
+                fs::metadata(&root).unwrap().created().unwrap()
+            );
+            let bytes = zip(&[("Bar/Bar.toc", "## Interface: 120105\n")]);
+            let mut selected = candidate(&installation, &bytes);
+            selected.url = server(bytes);
+            let prepared = selected
+                .prepare(&installation, None, temp.path())
+                .await
+                .unwrap();
+            let preserved = temp.path().join("preserved-addons-root");
+            let originals = prepared_tree(&root);
+            fs::rename(&root, &preserved).unwrap();
+            fs::rename(&replacement, &root).unwrap();
+            let before = prepared_tree(&root);
+            assert!(prepared.approve().apply().await.is_err());
+            assert_eq!(prepared_tree(&root), before);
+            assert_eq!(prepared_tree(&preserved), originals);
+            assert!(!root.join("Bar").exists());
+        });
+    }
+
+    #[test]
+    fn prepared_receipt_missing_foreign_or_modified_is_not_an_ownership_grant() {
+        async_std::task::block_on(async {
+            for mutation in 0..3 {
+                let (temp, installation, previous) = fixture();
+                let root = installation.directory.join("Interface/AddOns");
+                let bytes = zip(&[("Foo/Foo.toc", "## Interface: 120105\n")]);
+                let mut first = candidate(&installation, &bytes);
+                first.url = server(bytes.clone());
+                let old = first
+                    .install(&installation, &previous, temp.path())
+                    .await
+                    .unwrap();
+                let mut next = candidate(&installation, &bytes);
+                next.url = "http://127.0.0.1:1/no-request".into();
+                let id = if mutation == 0 {
+                    "0".repeat(64)
+                } else {
+                    old.receipt_id.clone()
+                };
+                if mutation == 1 {
+                    next.repository = "foreign/addon".into();
+                }
+                if mutation == 2 {
+                    fs::write(root.join("Foo/user.lua"), b"unrecorded edit").unwrap();
+                }
+                let before = prepared_tree(&root);
+                let error = next
+                    .prepare(&installation, Some(&id), temp.path())
+                    .await
+                    .err()
+                    .unwrap();
+                assert!(!error.to_string().contains("HTTP"));
+                assert_eq!(prepared_tree(&root), before);
+            }
+        });
+    }
+
     #[test]
     fn strict_manifest_requires_unique_explicit_product_and_digest() {
         let (_temp, installation, _) = fixture();

@@ -316,6 +316,154 @@ fn make_plan(addon: &Addon, root: &Path, incoming: Vec<String>) -> Result<Plan> 
     })
 }
 
+// Prepared installs reuse this plan and the same staging/transaction machinery.
+// No lock file, live journal or recovery action is created by this preflight.
+pub(crate) struct PreparedArchive {
+    root: PathBuf,
+    created: std::time::SystemTime,
+    plan: Plan,
+    destinations: BTreeMap<String, String>,
+    staged: BTreeMap<String, String>,
+    archive: String,
+}
+
+pub(crate) fn require_clean_install(root: &Path) -> Result<()> {
+    if exists(&root.join(TRANSACTION))? || exists(&root.join(RESTORE))? {
+        return Err(invalid(
+            "Pending installation or recovery requires inspection before a new install",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn archive_hash(path: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let metadata = fs::symlink_metadata(path)?;
+    if is_link(&metadata) || !metadata.is_file() || metadata.len() > MAX_TOTAL {
+        return Err(invalid("Prepared archive changed type or exceeds its size limit").into());
+    }
+    let mut hasher = Sha256::new();
+    let mut file = File::open(path)?.take(MAX_TOTAL + 1);
+    let mut count = 0;
+    let mut buffer = [0u8; 16 * 1024];
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        count += n as u64;
+        if count > MAX_TOTAL {
+            return Err(invalid("Prepared archive exceeds its size limit").into());
+        }
+        hasher.update(&buffer[..n]);
+    }
+    Ok(format!("sha256:{:x}", hasher.finalize()))
+}
+
+impl PreparedArchive {
+    pub(crate) fn previous(&self) -> &[String] {
+        &self.plan.previous
+    }
+    pub(crate) fn incoming(&self) -> &[String] {
+        &self.plan.incoming
+    }
+    pub(crate) fn validate_digest(&self, digest: &str) -> Result<()> {
+        if !self.archive.eq_ignore_ascii_case(digest) {
+            return Err(
+                invalid("Prepared archive differs from the verified release digest").into(),
+            );
+        }
+        Ok(())
+    }
+
+    fn names(&self) -> Vec<String> {
+        self.plan
+            .previous
+            .iter()
+            .chain(&self.plan.incoming)
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    pub(crate) fn validate_destinations(
+        &self,
+        addon: &Addon,
+        root: &Path,
+        incoming: &[String],
+    ) -> Result<()> {
+        if recovery_root(root)? != self.root
+            || fs::metadata(root)?.created()? != self.created
+            || incoming != self.plan.incoming
+            || make_plan(addon, root, incoming.to_vec())? != self.plan
+            || super::ownership::snapshot_paths(root, &self.names())? != self.destinations
+        {
+            return Err(
+                invalid("Prepared destination changed; review a new install preview").into(),
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_archive(&self, path: &Path) -> Result<()> {
+        if archive_hash(path)? != self.archive {
+            return Err(invalid("Prepared archive changed; download and review again").into());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_staged(&self, staged: &Path) -> Result<()> {
+        if super::ownership::snapshot_paths(staged, &self.plan.incoming)? != self.staged {
+            return Err(invalid("Staged contents differ from the approved preview").into());
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn prepare_archive(addon: &Addon, from: &Path, to: &Path) -> Result<PreparedArchive> {
+    let root = recovery_root(to)?;
+    require_clean_install(&root)?;
+    // Where a cooperative mutex already exists, preflight participates without
+    // creating persistent state. Apply always obtains the actual writer lock.
+    let lock = if exists(&root.join(LOCK))? {
+        Some(recovery_lock(&root)?.1)
+    } else {
+        None
+    };
+    let path = from.join(&addon.primary_folder_id);
+    let digest = archive_hash(&path)?;
+    let mut archive = zip::ZipArchive::new(File::open(&path)?)?;
+    let incoming = validate_archive(&mut archive)?;
+    let plan = make_plan(addon, &root, incoming)?;
+    let names: Vec<_> = plan
+        .previous
+        .iter()
+        .chain(&plan.incoming)
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let destinations = super::ownership::snapshot_paths(&root, &names)?;
+    let created = fs::metadata(&root)?.created()?;
+    stage(&mut archive, &from.join("preview"), &plan.incoming)?;
+    let staged = super::ownership::snapshot_paths(&from.join("preview"), &plan.incoming)?;
+    let prepared = PreparedArchive {
+        root: root.clone(),
+        created,
+        plan,
+        destinations,
+        staged,
+        archive: digest,
+    };
+    require_clean_install(&root)?;
+    prepared.validate_destinations(addon, &root, prepared.incoming())?;
+    prepared.validate_archive(&path)?;
+    drop(lock);
+    Ok(prepared)
+}
+
 fn marker(path: &Path) -> Result<bool> {
     if !exists(path)? {
         return Ok(false);
@@ -1124,6 +1272,23 @@ pub(crate) async fn install_addon_checked(
     to_directory: &Path,
     validate_staged: impl FnOnce(&Path, Vec<AddonFolder>) -> Result<Vec<AddonFolder>>,
 ) -> Result<Vec<AddonFolder>> {
+    install_addon_guarded(
+        addon,
+        from_directory,
+        to_directory,
+        |_, _| Ok(()),
+        validate_staged,
+    )
+    .await
+}
+
+pub(crate) async fn install_addon_guarded(
+    addon: &Addon,
+    from_directory: &Path,
+    to_directory: &Path,
+    before_recovery: impl FnOnce(&Path, &[String]) -> Result<()>,
+    validate_staged: impl FnOnce(&Path, Vec<AddonFolder>) -> Result<Vec<AddonFolder>>,
+) -> Result<Vec<AddonFolder>> {
     component(&addon.primary_folder_id)?;
     let zip_path = from_directory.join(&addon.primary_folder_id);
     let zip_file = File::open(&zip_path)?;
@@ -1153,6 +1318,7 @@ pub(crate) async fn install_addon_checked(
     })?;
     #[cfg(all(test, windows, feature = "no-self-update"))]
     process_tests::checkpoint(&root, "locked");
+    before_recovery(&root, &incoming)?;
     recover(&root)?;
     let plan = make_plan(addon, &root, incoming)?;
     let transaction = root.join(TRANSACTION);
