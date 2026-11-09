@@ -848,6 +848,16 @@ fn receipt_snapshot(
 }
 // Added 2026-10-28; original GPLv3 applies.
 fn recovery_snapshot(request: &RecoveryRequest) -> RecoveryResult {
+    recovery_snapshot_with(request, || Ok(()), || {})
+}
+
+// Private worker boundary, analogous to install's before-write/post-read hooks.
+// The native fixture gates run outside the core lock; production uses no-ops.
+fn recovery_snapshot_with(
+    request: &RecoveryRequest,
+    before_restore: impl FnOnce() -> Result<(), String>,
+    before_inspection: impl FnOnce(),
+) -> RecoveryResult {
     match &request.action {
         RecoveryAction::Inspect => RecoveryResult::Inspection(
             ajour_core::fs::inspect_recovery(&request.addons)
@@ -862,19 +872,22 @@ fn recovery_snapshot(request: &RecoveryRequest) -> RecoveryResult {
         RecoveryAction::Restore(approval) => {
             // Reaching this worker means fresh explicit consent was admitted
             // synchronously. Never show a dialog or wait under the core lock.
-            let outcome = ajour_core::fs::restore_originals_checked(
-                &request.addons,
-                approval.as_ref(),
-                |originals, move_aside| {
-                    originals == approval.originals()
-                        && move_aside == approval.move_aside_if_present()
-                },
-            )
-            .map_err(|error| error.to_string());
+            let outcome = before_restore().and_then(|()| {
+                ajour_core::fs::restore_originals_checked(
+                    &request.addons,
+                    approval.as_ref(),
+                    |originals, move_aside| {
+                        originals == approval.originals()
+                            && move_aside == approval.move_aside_if_present()
+                    },
+                )
+                .map_err(|error| error.to_string())
+            });
 
             // Run after every checked call, including Err. Completion is not
             // delivered, and physical GUI capacity is not released, until
             // this inspection finishes.
+            before_inspection();
             let inspection = ajour_core::fs::inspect_recovery(&request.addons)
                 .map(Arc::new)
                 .map_err(|error| error.to_string());
@@ -887,10 +900,17 @@ fn recovery_snapshot(request: &RecoveryRequest) -> RecoveryResult {
 }
 
 fn recovery_command(request: RecoveryRequest) -> Command<Message> {
+    recovery_command_with(request, recovery_snapshot)
+}
+
+fn recovery_command_with(
+    request: RecoveryRequest,
+    snapshot: impl FnOnce(&RecoveryRequest) -> RecoveryResult + Send + 'static,
+) -> Command<Message> {
     Command::perform(
         async move {
             let worker = request.clone();
-            let result = async_std::task::spawn_blocking(move || recovery_snapshot(&worker)).await;
+            let result = async_std::task::spawn_blocking(move || snapshot(&worker)).await;
             (request, result)
         },
         |(request, result)| Message::RecoveryDone(request, result),
@@ -1516,6 +1536,18 @@ impl Preview {
             ajour_core::github_releases::InstallApproval,
         ) -> Command<Message>,
     ) -> Command<Message> {
+        self.dispatch_with_workers(message, prepare, apply, recovery_command)
+    }
+    fn dispatch_with_workers(
+        &mut self,
+        message: Message,
+        prepare: impl FnOnce(install::Request) -> Command<Message>,
+        apply: impl FnOnce(
+            install::Request,
+            ajour_core::github_releases::InstallApproval,
+        ) -> Command<Message>,
+        recovery: impl FnOnce(RecoveryRequest) -> Command<Message>,
+    ) -> Command<Message> {
         // Keep only physical recovery completions after close. Queued clicks
         // cannot start another writer before the shell observes should_exit.
         if self.close_requested
@@ -1630,7 +1662,7 @@ impl Preview {
                 if !self.root_edited {
                     if let Some(request) = self.model.begin_recovery(false) {
                         self.recovery.root_page = 0;
-                        return recovery_command(request);
+                        return recovery(request);
                     }
                 }
             }
@@ -1638,7 +1670,7 @@ impl Preview {
                 if !self.root_edited {
                     if let Some(request) = self.model.begin_recovery(true) {
                         self.recovery.root_page = 0;
-                        return recovery_command(request);
+                        return recovery(request);
                     }
                 }
             }
@@ -1681,7 +1713,7 @@ impl Preview {
                     if let Some(request) = self.model.begin_restore_recovery(&preview) {
                         self.recovery.root_page = 0;
                         self.synchronize_choices();
-                        return recovery_command(request);
+                        return recovery(request);
                     }
                 }
             }

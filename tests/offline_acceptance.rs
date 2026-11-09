@@ -13,7 +13,10 @@ fn main() {
     #[cfg(not(debug_assertions))]
     let code = {
         println!("Offline acceptance is disabled in release builds.");
-        if args.iter().any(|arg| arg == "--visible") {
+        if args
+            .iter()
+            .any(|arg| arg == "--visible" || arg == "--recovery-visible")
+        {
             2
         } else {
             0

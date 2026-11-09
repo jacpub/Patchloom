@@ -20,6 +20,13 @@ fn runner_requires_exact_visible_request_and_opt_in() {
         EntryMode::Denied
     );
     assert_eq!(mode(&["--preflight"], false), EntryMode::Preflight);
+    assert_eq!(mode(&["--recovery-preflight"], false), EntryMode::Preflight);
+    assert_eq!(mode(&["--recovery-visible"], false), EntryMode::Denied);
+    assert_eq!(mode(&["--recovery-visible"], true), EntryMode::Visible);
+    assert_eq!(
+        mode(&["--recovery-visible", "--skip", "anything"], true),
+        EntryMode::Denied
+    );
     for args in [
         &[][..],
         &["--skip", "catalog::tests::test_catalog_download"][..],
@@ -74,6 +81,302 @@ async fn reached(gate: &Gate, point: Point) {
     })
     .await
     .unwrap();
+}
+
+async fn recovery_plan(h: &mut Acceptance) -> RecoveryPreview {
+    let before = tree(h.fixture.temp.path());
+    let command = h.handle(Event::App(Message::InspectRecovery));
+    execute(h, command).await;
+    assert!(h.fixture.app.model.recovery_error.is_none());
+    assert_ne!(
+        h.fixture
+            .app
+            .model
+            .recovery_inspection
+            .as_ref()
+            .unwrap()
+            .phase,
+        "none"
+    );
+    let command = h.handle(Event::App(Message::PreviewRecovery));
+    execute(h, command).await;
+    assert!(h.fixture.app.model.recovery_error.is_none());
+    let preview = h.fixture.app.model.recovery_preview.clone().unwrap();
+    assert_eq!(preview.approval.originals(), ["Bar", "Foo"]);
+    // The checked plan names every affected destination, including Bar which
+    // is currently absent. It authorizes moving these aside only if present.
+    assert_eq!(
+        preview.approval.move_aside_if_present(),
+        ["Bar", "Foo", "New"]
+    );
+    drop(h.view());
+    assert_eq!(tree(h.fixture.temp.path()), before);
+    preview
+}
+
+fn confirm_recovery(h: &mut Acceptance, preview: &RecoveryPreview) -> Command<Event> {
+    h.handle(Event::App(Message::RecoveryAckChanged(
+        preview.clone(),
+        "RESTORE".into(),
+    )));
+    h.handle(Event::App(Message::RestoreRecovery(preview.clone())))
+}
+
+#[test]
+fn recovery_wrapper_cancel_and_restore_use_checked_commands_and_preserve_all_versions() {
+    async_std::task::block_on(async {
+        let mut h = Acceptance::create_recovery();
+        let unrelated = tree(&h.fixture.addons.join("Keep"));
+        let data = tree(&h.fixture.data);
+        let saved = tree(&h.fixture.app.model.root.join("_retail_/WTF"));
+        let before = tree(h.fixture.temp.path());
+        drop(h.view());
+        assert_eq!(tree(h.fixture.temp.path()), before);
+        let preview = recovery_plan(&mut h).await;
+        h.handle(Event::App(Message::RestoreRecovery(preview.clone())));
+        assert!(h.fixture.app.model.recovery_job.is_none());
+        h.handle(Event::App(Message::CancelRecoveryPreview(preview.clone())));
+        assert_eq!(tree(h.fixture.temp.path()), before);
+        assert!(confirm_recovery(&mut h, &preview).futures().is_empty());
+        let preview = recovery_plan(&mut h).await;
+        let command = confirm_recovery(&mut h, &preview);
+        assert!(confirm_recovery(&mut h, &preview).futures().is_empty());
+        execute(&mut h, command).await;
+        assert!(matches!(h.fixture.app.model.recovery_outcome, Some(Ok(_))));
+        assert!(h.fixture.app.model.recovery_post_error.is_none());
+        for (path, bytes) in [
+            ("Foo/old.lua", b"original".as_slice()),
+            ("Bar/old.lua", b"original-bar".as_slice()),
+            (
+                ".patchloom-restore/backup/Foo/new.lua",
+                b"replacement".as_slice(),
+            ),
+            (
+                ".patchloom-restore/backup/New/new.lua",
+                b"additional".as_slice(),
+            ),
+        ] {
+            assert_eq!(fs::read(h.fixture.addons.join(path)).unwrap(), bytes);
+        }
+        assert_eq!(tree(&h.fixture.addons.join("Keep")), unrelated);
+        assert_eq!(tree(&h.fixture.data), data);
+        assert_eq!(tree(&h.fixture.app.model.root.join("_retail_/WTF")), saved);
+        assert!(h
+            .fixture
+            .addons
+            .join(".patchloom-install/plan.yml")
+            .is_file());
+        assert!(h
+            .fixture
+            .addons
+            .join(".patchloom-restore/committed")
+            .is_file());
+        drop(h.view());
+    });
+}
+
+#[test]
+fn recovery_wrapper_refuses_changed_content_without_moving_any_folder() {
+    async_std::task::block_on(async {
+        for path in [
+            "Foo/new.lua",
+            ".patchloom-install/backup/Foo/old.lua",
+            ".patchloom-install/plan.yml",
+        ] {
+            let mut h = Acceptance::create_recovery();
+            let preview = recovery_plan(&mut h).await;
+            fs::write(h.fixture.addons.join(path), b"changed after preview").unwrap();
+            let before = tree(h.fixture.temp.path());
+            let command = confirm_recovery(&mut h, &preview);
+            execute(&mut h, command).await;
+            // Valid-but-changed state is a typed refusal, malformed state an
+            // error. Neither may restore or move any fixture folder.
+            assert!(matches!(
+                h.fixture.app.model.recovery_outcome,
+                Some(Ok(ajour_core::fs::RecoveryRestoreOutcome::Changed)) | Some(Err(_))
+            ));
+            assert_eq!(tree(h.fixture.temp.path()), before);
+            assert!(!h.fixture.app.model.restoring());
+            drop(h.view());
+        }
+    });
+}
+
+#[test]
+fn recovery_wrapper_gates_keep_capacity_until_matching_completion_after_close() {
+    async_std::task::block_on(async {
+        for point in [Point::BeforeApply, Point::PostInspection] {
+            let mut h = Acceptance::create_recovery();
+            let preview = recovery_plan(&mut h).await;
+            h.handle(Event::Hold(point));
+            let mut futures = confirm_recovery(&mut h, &preview).futures();
+            assert_eq!(futures.len(), 1);
+            let request = h.fixture.app.model.recovery_job.clone().unwrap();
+            let task = async_std::task::spawn(futures.remove(0));
+            reached(&h.gate, point).await;
+            assert_eq!(
+                h.fixture.addons.join("Foo/old.lua").is_file(),
+                point == Point::PostInspection
+            );
+            h.handle(Event::App(Message::CloseRequested));
+            h.handle(Event::App(Message::CloseRequested));
+            assert!(!h.should_exit());
+            assert!(confirm_recovery(&mut h, &preview).futures().is_empty());
+            let mut foreign = request.clone();
+            foreign.token = Arc::new(());
+            h.handle(Event::App(Message::RecoveryDone(
+                foreign,
+                RecoveryResult::Restore {
+                    outcome: Err("foreign".into()),
+                    inspection: Err("foreign".into()),
+                },
+            )));
+            h.handle(Event::App(Message::RecoveryDone(
+                request,
+                RecoveryResult::Inspection(Err("wrong action".into())),
+            )));
+            assert!(!h.should_exit());
+            h.handle(Event::Continue);
+            let message = task.await;
+            let duplicate = message.clone();
+            let command = h.handle(message);
+            execute(&mut h, command).await;
+            assert!(h.should_exit());
+            assert!(!h.fixture.app.model.restoring());
+            assert!(matches!(h.fixture.app.model.recovery_outcome, Some(Ok(_))));
+            let after = tree(h.fixture.temp.path());
+            assert!(h.handle(duplicate).futures().is_empty());
+            assert_eq!(tree(h.fixture.temp.path()), after);
+        }
+    });
+}
+
+#[test]
+fn recovery_wrapper_preflight_and_rejected_messages_never_change_scope_or_environment() {
+    let environment = [
+        std::env::var_os("APPDATA"),
+        std::env::var_os("LOCALAPPDATA"),
+    ];
+    let mut h = Acceptance::create_recovery();
+    let scope = h.fixture.temp.path().to_path_buf();
+    let before = tree(&scope);
+    for message in [
+        Message::RootInputChanged("C:/outside-fixture".into()),
+        Message::OpenRoot,
+        Message::CheckRelease,
+        Message::RepositoryChanged("external/provider".into()),
+        Message::Install(InstallMessage::Prepare(false)),
+        Message::Rescan,
+    ] {
+        assert!(h.handle(Event::App(message)).futures().is_empty());
+    }
+    h.handle(Event::FixtureRelease(false));
+    let report = preflight(&h);
+    assert_eq!(report["scenario"], "recovery");
+    assert_eq!(report["native_window_started"], false);
+    drop(h.view());
+    assert_eq!(tree(&scope), before);
+    assert_eq!(
+        [
+            std::env::var_os("APPDATA"),
+            std::env::var_os("LOCALAPPDATA")
+        ],
+        environment
+    );
+    drop(h);
+    assert!(!scope.exists());
+}
+
+#[test]
+fn recovery_wrapper_drop_wakes_both_gates_and_retains_scope_through_postinspection() {
+    async_std::task::block_on(async {
+        for point in [Point::BeforeApply, Point::PostInspection] {
+            let mut h = Acceptance::create_recovery();
+            let scope = h.fixture.temp.path().to_path_buf();
+            let preview = recovery_plan(&mut h).await;
+            h.handle(Event::Hold(point));
+            let mut futures = confirm_recovery(&mut h, &preview).futures();
+            let task = async_std::task::spawn(futures.remove(0));
+            reached(&h.gate, point).await;
+            drop(h);
+            let result = async_std::future::timeout(Duration::from_secs(10), task)
+                .await
+                .unwrap();
+            match result {
+                Event::App(Message::RecoveryDone(
+                    _,
+                    RecoveryResult::Restore {
+                        outcome,
+                        inspection,
+                    },
+                )) => {
+                    assert_eq!(outcome.is_ok(), point == Point::PostInspection);
+                    assert!(
+                        inspection.is_ok(),
+                        "post-inspection must execute even on drop/error"
+                    );
+                }
+                _ => panic!("wrong recovery completion"),
+            }
+            drop(preview);
+            assert!(!scope.exists());
+        }
+    });
+}
+
+#[test]
+fn recovery_wrapper_stale_matching_completion_releases_capacity_without_publication() {
+    async_std::task::block_on(async {
+        let mut h = Acceptance::create_recovery();
+        let preview = recovery_plan(&mut h).await;
+        h.handle(Event::Hold(Point::BeforeApply));
+        let mut futures = confirm_recovery(&mut h, &preview).futures();
+        let task = async_std::task::spawn(futures.remove(0));
+        reached(&h.gate, Point::BeforeApply).await;
+        // Fault-injected logical staleness, not a reachable root-edit action:
+        // production deliberately refuses invalidation while restoring.
+        let generation = h.fixture.app.model.generation.clone();
+        h.fixture.app.model.generation = Arc::new(());
+        assert!(!Arc::ptr_eq(&generation, &h.fixture.app.model.generation));
+        assert!(h.fixture.app.model.recovery_job.is_some());
+        assert!(h.fixture.app.model.receipt_worker.is_some());
+        h.handle(Event::App(Message::CloseRequested));
+        assert!(!h.should_exit());
+        h.handle(Event::Continue);
+        let command = h.handle(task.await);
+        execute(&mut h, command).await;
+        assert!(h.should_exit());
+        assert!(!h.fixture.app.model.restoring());
+        assert!(h.fixture.app.model.recovery_outcome.is_none());
+        assert!(h.fixture.addons.join("Foo/old.lua").is_file());
+    });
+}
+
+#[test]
+fn recovery_wrapper_keeps_success_when_required_postinspection_fails() {
+    async_std::task::block_on(async {
+        let mut h = Acceptance::create_recovery();
+        let preview = recovery_plan(&mut h).await;
+        h.handle(Event::Hold(Point::PostInspection));
+        let mut futures = confirm_recovery(&mut h, &preview).futures();
+        let task = async_std::task::spawn(futures.remove(0));
+        reached(&h.gate, Point::PostInspection).await;
+        assert!(h.fixture.addons.join("Foo/old.lua").is_file());
+        fs::write(
+            h.fixture.addons.join(".patchloom-install/plan.yml"),
+            b"invalid journal after commit",
+        )
+        .unwrap();
+        h.handle(Event::App(Message::CloseRequested));
+        assert!(!h.should_exit());
+        h.handle(Event::Continue);
+        let command = h.handle(task.await);
+        execute(&mut h, command).await;
+        assert!(h.should_exit());
+        assert!(matches!(h.fixture.app.model.recovery_outcome, Some(Ok(_))));
+        assert!(h.fixture.app.model.recovery_post_error.is_some());
+        drop(h.view());
+    });
 }
 
 #[test]

@@ -14,9 +14,16 @@ enum EntryMode {
 }
 fn entry_mode(args: &[std::ffi::OsString], opt_in: bool) -> EntryMode {
     match args {
-        [arg] if arg == "--preflight" => EntryMode::Preflight,
-        [arg] if arg == "--visible" && opt_in => EntryMode::Visible,
-        _ if args.iter().any(|arg| arg == "--visible") => EntryMode::Denied,
+        [arg] if arg == "--preflight" || arg == "--recovery-preflight" => EntryMode::Preflight,
+        [arg] if (arg == "--visible" || arg == "--recovery-visible") && opt_in => {
+            EntryMode::Visible
+        }
+        _ if args
+            .iter()
+            .any(|arg| arg == "--visible" || arg == "--recovery-visible") =>
+        {
+            EntryMode::Denied
+        }
         _ => EntryMode::Skip,
     }
 }
@@ -96,6 +103,7 @@ struct Acceptance {
     bytes: Vec<u8>,
     buttons: [button::State; 6],
     scroll: scrollable::State,
+    recovery: bool,
 }
 impl Drop for Acceptance {
     fn drop(&mut self) {
@@ -112,11 +120,50 @@ impl Acceptance {
             bytes: Vec::new(),
             buttons: Default::default(),
             scroll: scrollable::State::new(),
+            recovery: false,
         }
+    }
+    fn create_recovery() -> Self {
+        let mut harness = Self::create();
+        harness.recovery = true;
+        let addons = &harness.fixture.addons;
+        let transaction = addons.join(".patchloom-install");
+        fs::create_dir_all(transaction.join("backup/Bar")).unwrap();
+        fs::create_dir(transaction.join("backup/Foo")).unwrap();
+        fs::create_dir(transaction.join("staged")).unwrap();
+        fs::write(
+            transaction.join("plan.yml"),
+            b"version: 1\nprevious: [Bar, Foo]\nincoming: [Foo, New]\n",
+        )
+        .unwrap();
+        fs::write(transaction.join("ready"), b"").unwrap();
+        fs::write(transaction.join("backup/Bar/old.lua"), b"original-bar").unwrap();
+        fs::write(transaction.join("backup/Foo/old.lua"), b"original").unwrap();
+        for (folder, bytes) in [
+            ("Foo", b"replacement".as_slice()),
+            ("New", b"additional".as_slice()),
+        ] {
+            fs::create_dir(addons.join(folder)).unwrap();
+            fs::write(addons.join(folder).join("new.lua"), bytes).unwrap();
+        }
+        fs::write(
+            addons.join(".patchloom-install.lock"),
+            b"fixture mutex bytes\n",
+        )
+        .unwrap();
+        let saved = harness
+            .fixture
+            .app
+            .model
+            .root
+            .join("_retail_/WTF/Account/SavedVariables");
+        fs::create_dir_all(&saved).unwrap();
+        fs::write(saved.join("keep.lua"), b"unrelated saved variables").unwrap();
+        harness
     }
     fn choose_release(&mut self, update: bool) {
         let app = &mut self.fixture.app;
-        if app.close_requested {
+        if app.close_requested || self.recovery {
             return;
         }
         if let Some(request) = app.model.begin_release() {
@@ -149,7 +196,11 @@ impl Acceptance {
     fn handle(&mut self, event: Event) -> Command<Event> {
         match event {
             Event::FixtureRelease(update) => self.choose_release(update),
-            Event::Hold(point) if self.fixture.app.model.install.job.is_none() => {
+            Event::Hold(point)
+                if !self.fixture.app.close_requested
+                    && self.fixture.app.model.install.job.is_none()
+                    && self.fixture.app.model.recovery_job.is_none() =>
+            {
                 self.gate.arm(point)
             }
             Event::Continue => self.gate.release(),
@@ -165,6 +216,44 @@ impl Acceptance {
             self.gate.close();
             self.fixture.app.dispatch(Message::CloseRequested);
             return Command::none();
+        }
+        if self.recovery {
+            if !matches!(
+                &message,
+                Message::InspectRecovery
+                    | Message::PreviewRecovery
+                    | Message::RestoreRecovery(_)
+                    | Message::RecoveryAckChanged(..)
+                    | Message::RecoveryPage(..)
+                    | Message::RecoveryRootPage(..)
+                    | Message::CancelRecoveryPreview(_)
+                    | Message::RecoveryDone(..)
+                    | Message::CloseRequested
+            ) {
+                return Command::none();
+            }
+            let scope = self.fixture.temp.clone();
+            let gate = self.gate.clone();
+            return self.fixture.app.dispatch_with_workers(
+                message,
+                |_| Command::none(),
+                |_, _| Command::none(),
+                move |request| {
+                    recovery_command_with(request, move |request| {
+                        let _scope = scope;
+                        recovery_snapshot_with(
+                            request,
+                            || {
+                                gate.wait(Point::BeforeApply)
+                                    .map_err(|error| error.to_string())
+                            },
+                            || {
+                                let _ = gate.wait(Point::PostInspection);
+                            },
+                        )
+                    })
+                },
+            );
         }
         if !matches!(
             &message,
@@ -250,6 +339,41 @@ impl Application for Acceptance {
         self.handle(message)
     }
     fn view(&mut self) -> Element<'_, Event> {
+        if self.recovery {
+            let [_, _, _, before, after, release] = &mut self.buttons;
+            let gates = Row::new()
+                .spacing(8)
+                .push(
+                    Button::new(before, Text::new("Hold before restore"))
+                        .on_press(Event::Hold(Point::BeforeApply)),
+                )
+                .push(
+                    Button::new(after, Text::new("Hold before follow-up check"))
+                        .on_press(Event::Hold(Point::PostInspection)),
+                )
+                .push(Button::new(release, Text::new("Continue")).on_press(Event::Continue));
+            let status = format!(
+                "Gate: {:?}; restore/post-read reservation: {}; close requested: {}",
+                self.gate.reached(),
+                self.fixture.app.model.restoring(),
+                self.fixture.app.close_requested
+            );
+            let app = &mut self.fixture.app;
+            let panel = app.recovery.view(&app.model, false).map(Event::App);
+            return Scrollable::new(&mut self.scroll)
+                .push(
+                    Column::new()
+                        .spacing(12)
+                        .padding(16)
+                        .push(Text::new(
+                            "Offline recovery fixture: temporary folders only. No network.",
+                        ))
+                        .push(Text::new(status))
+                        .push(gates)
+                        .push(panel),
+                )
+                .into();
+        }
         let [fresh, update, preparation, apply, inspection, release] = &mut self.buttons;
         let controls = Row::new()
             .spacing(8)
@@ -301,6 +425,9 @@ impl Application for Acceptance {
 // Called synchronously by the harness-free test target's process main. Ordinary
 // unit tests have no native entry: libtest workers cannot host this event loop.
 pub(crate) fn offline_acceptance_entry(args: &[std::ffi::OsString]) -> i32 {
+    let recovery = args
+        .iter()
+        .any(|arg| arg == "--recovery-preflight" || arg == "--recovery-visible");
     match entry_mode(
         args,
         std::env::var_os("PATCHLOOM_VISIBLE_FIXTURE_APPROVED").as_deref()
@@ -313,11 +440,15 @@ pub(crate) fn offline_acceptance_entry(args: &[std::ffi::OsString]) -> i32 {
             0
         }
         EntryMode::Denied => {
-            eprintln!("Visible acceptance requires only --visible and process-local PATCHLOOM_VISIBLE_FIXTURE_APPROVED=yes.");
+            eprintln!("Visible acceptance requires only --visible or --recovery-visible and process-local PATCHLOOM_VISIBLE_FIXTURE_APPROVED=yes.");
             2
         }
         EntryMode::Preflight => {
-            let harness = Acceptance::create();
+            let harness = if recovery {
+                Acceptance::create_recovery()
+            } else {
+                Acceptance::create()
+            };
             let report = preflight(&harness);
             println!("{}", serde_json::to_string(&report).unwrap());
             0
@@ -327,7 +458,7 @@ pub(crate) fn offline_acceptance_entry(args: &[std::ffi::OsString]) -> i32 {
                 eprintln!("Use the harness-free offline_acceptance executable on its process main thread.");
                 return 2;
             }
-            run_visible_fixture();
+            run_visible_fixture(recovery);
             0
         }
     }
@@ -348,19 +479,24 @@ fn preflight(harness: &Acceptance) -> serde_json::Value {
     assert_eq!(fixture.app.model.root, fixture.temp.path().join("wow"));
     assert!(fixture.app.model.install.job.is_none());
     assert!(fixture.app.model.release_worker.is_none());
-    serde_json::json!({"target":"offline_acceptance", "mode":"preflight", "native_window_started":false,
+    assert!(fixture.app.model.recovery_job.is_none());
+    serde_json::json!({"target":"offline_acceptance", "mode":"preflight", "scenario":if harness.recovery {"recovery"} else {"install"}, "native_window_started":false,
         "thread_name":std::thread::current().name(), "version":env!("CARGO_PKG_VERSION"),
         "no_self_update":cfg!(feature="no-self-update"), "scope":fixture.temp.path(),
         "root":fixture.app.model.root, "addons":fixture.addons, "cache":fixture.cache, "data":fixture.data})
 }
 
-fn run_visible_fixture() {
+fn run_visible_fixture(recovery: bool) {
     assert_eq!(
         std::env::var("PATCHLOOM_VISIBLE_FIXTURE_APPROVED").as_deref(),
         Ok("yes"),
         "No native fixture window without explicit approval"
     );
-    let harness = Acceptance::create();
+    let harness = if recovery {
+        Acceptance::create_recovery()
+    } else {
+        Acceptance::create()
+    };
     println!("{}", serde_json::to_string(&preflight(&harness)).unwrap());
     // Process-local only, in this ignored native entry. No routine headless
     // test mutates environment variables or invokes this path.
