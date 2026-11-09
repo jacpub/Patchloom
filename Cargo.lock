@@ -122,6 +122,7 @@ dependencies = [
  "url",
  "urlencoding",
  "walkdir",
+ "yaml-rust",
  "zip",
  "zstd",
 ]

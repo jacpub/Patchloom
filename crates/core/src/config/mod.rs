@@ -10,6 +10,7 @@ use std::fs::create_dir_all;
 use std::path::{Path, PathBuf};
 
 mod addons;
+pub mod legacy_import;
 mod wow;
 
 use crate::fs::PersistentData;
