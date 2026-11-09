@@ -1,5 +1,31 @@
 # Patchloom developer notes
 
+## Inspect a legacy settings copy
+
+```sh
+ajour --inspect-legacy-config ./settings-copy.yml
+```
+
+Supply a separate copy explicitly. This command prints JSON to stdout and exits
+without opening a window, loading current settings or contacting providers. It
+does not import settings, write an output file or check the game paths mentioned
+in the copy. Relative source paths use the current directory. The command refuses
+parent-directory components and linked/reparse paths. On Windows it also refuses
+UNC/device spellings, DOS device names, alternate streams and drive-relative
+paths. These spelling checks do not identify mapped or network filesystem mounts.
+
+Exit 0 means the copy was inspected; it does not mean its locations or flavors
+are valid for current WoW. Read the ambiguity notices. Read/parse failures and
+conflicting startup options exit unsuccessfully with a short error on stderr.
+The input limit is 64 KiB, including comments. Output contains bounded path/flavor
+hints and a source digest, so remove private paths before sharing a report.
+Unknown settings are counted rather than returned or imported.
+
+File/ancestor checks are point-in-time checks, not protection against hostile
+concurrent ancestor replacement. The byte limit does not bound filesystem latency.
+Inspect a stable local copy. No settings
+migration, ownership decision or later write is authorized by the report.
+
 ## Read-only inventory preview
 
 Use a disposable copied WoW root with `.build.info` and product directories:

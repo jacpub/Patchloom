@@ -70,6 +70,13 @@ pub fn validate_opts_or_exit(
             author = env!("CARGO_PKG_AUTHORS"),
             setting = AppSettings::DisableHelpSubcommand)]
 pub struct Opts {
+    #[structopt(
+        long,
+        parse(from_os_str),
+        value_name = "COPY",
+        help = "Inspect a supplied copy of legacy settings and print JSON without importing it"
+    )]
+    pub inspect_legacy_config: Option<PathBuf>,
     // Modified 2026-10-28; original GPLv3 applies.
     #[structopt(
         long,

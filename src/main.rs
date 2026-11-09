@@ -8,6 +8,7 @@ mod cli;
 mod command;
 mod gui;
 mod inventory_preview;
+mod legacy_config;
 mod localization;
 #[cfg(target_os = "windows")]
 mod process;
@@ -48,6 +49,7 @@ pub fn main() {
         .as_ref()
         .map(|o| {
             o.command.is_some()
+                || o.inspect_legacy_config.is_some()
                 || o.preview.is_some()
                 || o.preview_check
                 || o.preview_window_check
@@ -63,6 +65,15 @@ pub fn main() {
     // parsed `Opts` struct. This also handles setting up our windows release build
     // fix that allows us to print to the console when not using the GUI.
     let opts = cli::validate_opts_or_exit(opts_result, is_cli, is_debug);
+
+    // Explicit copied-settings inspection must precede every startup side effect.
+    if let Some(copy) = opts.inspect_legacy_config.as_deref() {
+        if let Err(error) = legacy_config::run(&opts, copy) {
+            eprintln!("Patchloom settings inspection: {}", error);
+            std::process::exit(1);
+        }
+        return;
+    }
 
     // Modified 2026-10-28; original license and attribution apply.
     // Every no-subcommand launch returns here before any legacy side effect.
