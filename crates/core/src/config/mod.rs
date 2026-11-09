@@ -219,6 +219,10 @@ fn get_pattern_format(relative_path: &str) -> String {
 }
 
 impl PersistentData for Config {
+    // Preserve user settings on load errors; caches retain their own policy.
+    // Modified 2026-11-09; original GPLv3 applies.
+    const PRESERVE_LOAD_ERRORS: bool = true;
+
     fn relative_path() -> PathBuf {
         PathBuf::from("ajour.yml")
     }
