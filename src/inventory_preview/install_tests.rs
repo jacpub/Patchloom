@@ -2,8 +2,11 @@
 use super::*;
 use std::fs;
 
-#[path = "visible_acceptance.rs"]
-mod acceptance;
+mod acceptance {
+    include!("visible_acceptance.rs");
+    include!("visible_acceptance_tests.rs");
+}
+use acceptance::{drain, fixture, Fixture};
 
 #[test]
 fn real_clean_success_has_no_recovery_warning_but_retained_inspection_does() {
@@ -74,56 +77,6 @@ fn idle_close_never_admits_a_queued_install_and_last_drop_disposes_only_cache() 
     });
 }
 
-struct Fixture {
-    temp: Arc<tempfile::TempDir>,
-    app: Preview,
-    addons: PathBuf,
-    cache: PathBuf,
-    data: PathBuf,
-}
-async fn fixture() -> Fixture {
-    let temp = Arc::new(tempfile::tempdir().unwrap());
-    let root = temp.path().join("wow");
-    let addons = root.join("_retail_/Interface/AddOns");
-    fs::create_dir_all(addons.join("Keep")).unwrap();
-    fs::write(addons.join("Keep/Keep.toc"), "## Interface: 120105\n").unwrap();
-    fs::write(addons.join("Keep/unrelated.lua"), b"unrelated user data").unwrap();
-    fs::write(
-        root.join(".build.info"),
-        "Active!DEC:1|Product!STRING:0|Version!STRING:0\n1|wow|12.1.5.70575\n",
-    )
-    .unwrap();
-    let cache = temp.path().join("cache");
-    fs::create_dir(&cache).unwrap();
-    let data = temp.path().join("data");
-    fs::create_dir(&data).unwrap();
-    fs::write(data.join("config"), b"preserved settings").unwrap();
-    let (mut app, command) = Preview::new(Flags {
-        root,
-        native_check: false,
-    });
-    drain(&mut app, command).await;
-    app.dispatch(Message::Select(Product::Retail));
-    app.dispatch(Message::RepositoryChanged("fixture/addon".into()));
-    Fixture {
-        temp,
-        app,
-        addons,
-        cache,
-        data,
-    }
-}
-async fn drain(app: &mut Preview, mut command: Command<Message>) {
-    for _ in 0..5 {
-        let mut futures = command.futures();
-        if futures.is_empty() {
-            return;
-        }
-        assert_eq!(futures.len(), 1);
-        command = app.dispatch(futures.remove(0).await);
-    }
-    panic!("unexpected command loop");
-}
 fn checked(f: &mut Fixture, version: &str, entries: &[(&str, &str)]) -> Vec<u8> {
     let command = f.app.dispatch(Message::CheckRelease);
     assert_eq!(command.futures().len(), 1); // do not poll real metadata HTTP
@@ -177,7 +130,7 @@ fn confirm(f: &mut Fixture) -> Command<Message> {
         .is_empty());
     f.app.dispatch(Message::Install(InstallMessage::Apply(r)))
 }
-fn tree(root: &std::path::Path) -> std::collections::BTreeMap<PathBuf, Option<Vec<u8>>> {
+pub(super) fn tree(root: &std::path::Path) -> std::collections::BTreeMap<PathBuf, Option<Vec<u8>>> {
     fn visit(
         base: &std::path::Path,
         p: &std::path::Path,

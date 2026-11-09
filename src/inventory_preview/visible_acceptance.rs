@@ -1,8 +1,25 @@
-//! Offline, disposable native acceptance wrapper. Never a runtime entry point.
-//! Loaded only by debug fixture unit tests; original GPLv3 applies, 2026-11-06.
+// Offline, disposable native acceptance wrapper. Never a runtime entry point.
+// Loaded only by debug fixture unit tests; original GPLv3 applies, 2026-11-06.
 use super::*;
+use std::fs;
 use std::sync::Condvar;
 use std::time::Duration;
+
+#[derive(Debug, PartialEq, Eq)]
+enum EntryMode {
+    Skip,
+    Preflight,
+    Visible,
+    Denied,
+}
+fn entry_mode(args: &[std::ffi::OsString], opt_in: bool) -> EntryMode {
+    match args {
+        [arg] if arg == "--preflight" => EntryMode::Preflight,
+        [arg] if arg == "--visible" && opt_in => EntryMode::Visible,
+        _ if args.iter().any(|arg| arg == "--visible") => EntryMode::Denied,
+        _ => EntryMode::Skip,
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Point {
@@ -281,22 +298,77 @@ impl Application for Acceptance {
     }
 }
 
-// The ONLY native entry. Routine cargo test and the exact bridge invocations
-// skip it. This milestone compiles it with --no-run, never executes it.
-#[test]
-#[ignore = "opens a native window; requires explicit user approval for this exact offline fixture"]
-fn visible_offline_acceptance_requires_specific_approval() {
+// Called synchronously by the harness-free test target's process main. Ordinary
+// unit tests have no native entry: libtest workers cannot host this event loop.
+pub(crate) fn offline_acceptance_entry(args: &[std::ffi::OsString]) -> i32 {
+    match entry_mode(
+        args,
+        std::env::var_os("PATCHLOOM_VISIBLE_FIXTURE_APPROVED").as_deref()
+            == Some(std::ffi::OsStr::new("yes")),
+    ) {
+        EntryMode::Skip => {
+            println!(
+                "Offline acceptance skipped; use --preflight, or explicitly approved --visible."
+            );
+            0
+        }
+        EntryMode::Denied => {
+            eprintln!("Visible acceptance requires only --visible and process-local PATCHLOOM_VISIBLE_FIXTURE_APPROVED=yes.");
+            2
+        }
+        EntryMode::Preflight => {
+            let harness = Acceptance::create();
+            let report = preflight(&harness);
+            println!("{}", serde_json::to_string(&report).unwrap());
+            0
+        }
+        EntryMode::Visible => {
+            if std::thread::current().name() != Some("main") {
+                eprintln!("Use the harness-free offline_acceptance executable on its process main thread.");
+                return 2;
+            }
+            run_visible_fixture();
+            0
+        }
+    }
+}
+
+fn preflight(harness: &Acceptance) -> serde_json::Value {
+    let fixture = &harness.fixture;
+    let scope = fixture.temp.path().canonicalize().unwrap();
+    for path in [
+        &fixture.app.model.root,
+        &fixture.addons,
+        &fixture.cache,
+        &fixture.data,
+    ] {
+        assert!(path.canonicalize().unwrap().starts_with(&scope));
+        assert!(!fs::symlink_metadata(path).unwrap().file_type().is_symlink());
+    }
+    assert_eq!(fixture.app.model.root, fixture.temp.path().join("wow"));
+    assert!(fixture.app.model.install.job.is_none());
+    assert!(fixture.app.model.release_worker.is_none());
+    serde_json::json!({"target":"offline_acceptance", "mode":"preflight", "native_window_started":false,
+        "thread_name":std::thread::current().name(), "version":env!("CARGO_PKG_VERSION"),
+        "no_self_update":cfg!(feature="no-self-update"), "scope":fixture.temp.path(),
+        "root":fixture.app.model.root, "addons":fixture.addons, "cache":fixture.cache, "data":fixture.data})
+}
+
+fn run_visible_fixture() {
     assert_eq!(
         std::env::var("PATCHLOOM_VISIBLE_FIXTURE_APPROVED").as_deref(),
         Ok("yes"),
         "No native fixture window without explicit approval"
     );
     let harness = Acceptance::create();
+    println!("{}", serde_json::to_string(&preflight(&harness)).unwrap());
     // Process-local only, in this ignored native entry. No routine headless
     // test mutates environment variables or invokes this path.
     let _data_scope = DataScope::enter(&harness.fixture.data);
+    let base = preview_settings(harness.fixture.app.model.root.clone(), false, false);
     let mut settings = Settings::with_flags(Some(harness));
-    settings.exit_on_close_request = false;
+    settings.exit_on_close_request = base.exit_on_close_request;
+    settings.default_text_size = base.default_text_size;
     settings.window.size = (1100, 780);
     Acceptance::run(settings).unwrap();
 }
@@ -325,267 +397,53 @@ impl Drop for DataScope {
     }
 }
 
-async fn execute(harness: &mut Acceptance, command: Command<Event>) {
-    let mut pending = command.futures();
-    for _ in 0..8 {
-        if pending.is_empty() {
+pub(super) struct Fixture {
+    pub(super) temp: Arc<tempfile::TempDir>,
+    pub(super) app: Preview,
+    pub(super) addons: PathBuf,
+    pub(super) cache: PathBuf,
+    pub(super) data: PathBuf,
+}
+pub(super) async fn fixture() -> Fixture {
+    let temp = Arc::new(tempfile::tempdir().unwrap());
+    let root = temp.path().join("wow");
+    let addons = root.join("_retail_/Interface/AddOns");
+    fs::create_dir_all(addons.join("Keep")).unwrap();
+    fs::write(addons.join("Keep/Keep.toc"), "## Interface: 120105\n").unwrap();
+    fs::write(addons.join("Keep/unrelated.lua"), b"unrelated user data").unwrap();
+    fs::write(
+        root.join(".build.info"),
+        "Active!DEC:1|Product!STRING:0|Version!STRING:0\n1|wow|12.1.5.70575\n",
+    )
+    .unwrap();
+    let cache = temp.path().join("cache");
+    fs::create_dir(&cache).unwrap();
+    let data = temp.path().join("data");
+    fs::create_dir(&data).unwrap();
+    fs::write(data.join("config"), b"preserved settings").unwrap();
+    let (mut app, command) = Preview::new(Flags {
+        root,
+        native_check: false,
+    });
+    drain(&mut app, command).await;
+    app.dispatch(Message::Select(Product::Retail));
+    app.dispatch(Message::RepositoryChanged("fixture/addon".into()));
+    Fixture {
+        temp,
+        app,
+        addons,
+        cache,
+        data,
+    }
+}
+pub(super) async fn drain(app: &mut Preview, mut command: Command<Message>) {
+    for _ in 0..5 {
+        let mut futures = command.futures();
+        if futures.is_empty() {
             return;
         }
-        assert_eq!(pending.len(), 1);
-        pending = harness.handle(pending.remove(0).await).futures();
+        assert_eq!(futures.len(), 1);
+        command = app.dispatch(futures.remove(0).await);
     }
-    panic!("unexpected fixture command loop");
-}
-async fn reached(gate: &Gate, point: Point) {
-    async_std::future::timeout(Duration::from_secs(10), async {
-        while gate.reached() != Some(point) {
-            async_std::task::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .unwrap();
-}
-
-#[test]
-fn wrapper_rejects_external_scope_and_provider_messages_without_commands() {
-    let mut h = Acceptance::create();
-    let before = tree(h.fixture.temp.path());
-    for m in [
-        Message::RootInputChanged("C:/not-a-fixture".into()),
-        Message::OpenRoot,
-        Message::RepositoryChanged("external/repository".into()),
-        Message::CheckRelease,
-        Message::ReceiptIdChanged("unverified".into()),
-        Message::InspectRecovery,
-    ] {
-        assert!(h.handle(Event::App(m)).futures().is_empty());
-    }
-    drop(h.view());
-    assert_eq!(tree(h.fixture.temp.path()), before);
-    assert!(h.fixture.app.model.release_worker.is_none());
-    assert!(h.fixture.app.model.install.job.is_none());
-    assert_eq!(h.fixture.app.model.root, h.fixture.temp.path().join("wow"));
-}
-
-#[test]
-fn preparation_gate_cancel_releases_worker_and_preserves_all_fixture_data() {
-    async_std::task::block_on(async {
-        let mut h = Acceptance::create();
-        let before = tree(&h.fixture.addons);
-        let data = tree(&h.fixture.data);
-        h.handle(Event::FixtureRelease(false));
-        h.handle(Event::Hold(Point::Preparation));
-        let mut futures = h
-            .handle(Event::App(Message::Install(InstallMessage::Prepare(false))))
-            .futures();
-        let task = async_std::task::spawn(futures.remove(0));
-        reached(&h.gate, Point::Preparation).await;
-        let request = h.fixture.app.model.install.job.as_ref().unwrap().clone();
-        let cancel = h.handle(Event::App(Message::Install(InstallMessage::Cancel(
-            request,
-        ))));
-        execute(&mut h, cancel).await;
-        let message = task.await;
-        let command = h.handle(message);
-        execute(&mut h, command).await;
-        assert!(h.fixture.app.model.install.job.is_none());
-        assert!(h.fixture.app.model.install.ready.is_none());
-        assert!(fs::read_dir(&h.fixture.cache).unwrap().next().is_none());
-        assert_eq!(tree(&h.fixture.addons), before);
-        assert_eq!(tree(&h.fixture.data), data);
-    });
-}
-
-#[test]
-fn actual_worker_preapply_and_postapply_gates_defer_close_and_finish_matching_work() {
-    async_std::task::block_on(async {
-        for point in [Point::BeforeApply, Point::PostInspection] {
-            let mut h = Acceptance::create();
-            h.handle(Event::FixtureRelease(false));
-            let prepare = h.handle(Event::App(Message::Install(InstallMessage::Prepare(false))));
-            execute(&mut h, prepare).await;
-            let request = h
-                .fixture
-                .app
-                .model
-                .install
-                .ready
-                .as_ref()
-                .unwrap()
-                .request
-                .clone();
-            h.handle(Event::App(Message::Install(InstallMessage::Ack(
-                request.clone(),
-                "APPLY".into(),
-            ))));
-            h.handle(Event::Hold(point));
-            let mut futures = h
-                .handle(Event::App(Message::Install(InstallMessage::Apply(request))))
-                .futures();
-            let task = async_std::task::spawn(futures.remove(0));
-            reached(&h.gate, point).await;
-            assert!(h.fixture.app.model.restoring());
-            assert_eq!(
-                h.fixture.addons.join("Alpha").exists(),
-                point == Point::PostInspection
-            );
-            h.handle(Event::App(Message::CloseRequested));
-            h.handle(Event::App(Message::CloseRequested));
-            h.handle(Event::FixtureRelease(true));
-            assert!(!h.should_exit());
-            h.handle(Event::Continue);
-            let message = task.await;
-            let command = h.handle(message);
-            execute(&mut h, command).await;
-            assert!(h.should_exit());
-            assert!(!h.fixture.app.model.restoring());
-            assert!(h.fixture.addons.join("Alpha/Alpha.toc").is_file());
-            assert_eq!(
-                fs::read(h.fixture.addons.join("Keep/unrelated.lua")).unwrap(),
-                b"unrelated user data"
-            );
-        }
-    });
-}
-
-#[test]
-fn wrapper_real_receipt_update_preview_and_apply_preserve_unrelated_data() {
-    async_std::task::block_on(async {
-        let mut h = Acceptance::create();
-        let data = tree(&h.fixture.data);
-        for update in [false, true] {
-            h.handle(Event::FixtureRelease(update));
-            let command = h.handle(Event::App(Message::Install(InstallMessage::Prepare(
-                update,
-            ))));
-            execute(&mut h, command).await;
-            let ready = h.fixture.app.model.install.ready.as_ref().unwrap();
-            if update {
-                assert_eq!(ready.added, ["New"]);
-                assert_eq!(ready.replaced, ["Alpha"]);
-                assert_eq!(ready.removed, ["Old"]);
-            } else {
-                assert_eq!(ready.added, ["Alpha", "Old"]);
-            }
-            let request = ready.request.clone();
-            h.handle(Event::App(Message::Install(InstallMessage::Ack(
-                request.clone(),
-                "APPLY".into(),
-            ))));
-            let command = h.handle(Event::App(Message::Install(InstallMessage::Apply(request))));
-            execute(&mut h, command).await;
-            assert!(h
-                .fixture
-                .app
-                .model
-                .install
-                .outcome
-                .as_ref()
-                .unwrap()
-                .operation
-                .is_ok());
-            assert!(h.fixture.app.model.receipt.is_some());
-        }
-        assert!(!h.fixture.addons.join("Old").exists());
-        assert_eq!(
-            fs::read(h.fixture.addons.join("Keep/unrelated.lua")).unwrap(),
-            b"unrelated user data"
-        );
-        assert_eq!(tree(&h.fixture.data), data);
-    });
-}
-
-#[test]
-fn wrapper_drop_wakes_prepare_worker_and_keeps_owned_root_alive_until_return() {
-    async_std::task::block_on(async {
-        let mut h = Acceptance::create();
-        let root = h.fixture.temp.path().to_path_buf();
-        h.handle(Event::FixtureRelease(false));
-        h.handle(Event::Hold(Point::Preparation));
-        let mut futures = h
-            .handle(Event::App(Message::Install(InstallMessage::Prepare(false))))
-            .futures();
-        let task = async_std::task::spawn(futures.remove(0));
-        reached(&h.gate, Point::Preparation).await;
-        drop(h);
-        let result = async_std::future::timeout(Duration::from_secs(10), task)
-            .await
-            .unwrap();
-        assert!(matches!(
-            result,
-            Event::App(Message::Install(InstallMessage::Done(
-                _,
-                ResultMessage::Prepared(Err(_))
-            )))
-        ));
-        assert!(!root.exists());
-    });
-}
-
-#[test]
-fn gate_timeout_fails_closed_without_an_unbounded_wait() {
-    let gate = Gate::default();
-    gate.arm(Point::BeforeApply);
-    assert!(gate
-        .wait_for(Point::BeforeApply, Duration::from_millis(1))
-        .is_err());
-    gate.close();
-    assert!(gate.wait(Point::Preparation).is_err());
-}
-
-#[test]
-fn wrapper_drop_keeps_apply_scope_alive_through_every_post_read() {
-    async_std::task::block_on(async {
-        for point in [Point::BeforeApply, Point::PostInspection] {
-            let mut h = Acceptance::create();
-            let root = h.fixture.temp.path().to_path_buf();
-            h.handle(Event::FixtureRelease(false));
-            let prepare = h.handle(Event::App(Message::Install(InstallMessage::Prepare(false))));
-            execute(&mut h, prepare).await;
-            let request = h
-                .fixture
-                .app
-                .model
-                .install
-                .ready
-                .as_ref()
-                .unwrap()
-                .request
-                .clone();
-            h.handle(Event::App(Message::Install(InstallMessage::Ack(
-                request.clone(),
-                "APPLY".into(),
-            ))));
-            h.handle(Event::Hold(point));
-            let mut futures = h
-                .handle(Event::App(Message::Install(InstallMessage::Apply(request))))
-                .futures();
-            let task = async_std::task::spawn(futures.remove(0));
-            reached(&h.gate, point).await;
-            drop(h);
-            let message = async_std::future::timeout(Duration::from_secs(10), task)
-                .await
-                .unwrap();
-            let outcome = match message {
-                Event::App(Message::Install(InstallMessage::Done(
-                    _,
-                    ResultMessage::Applied(outcome),
-                ))) => outcome,
-                _ => panic!("wrong worker result"),
-            };
-            assert_eq!(outcome.operation.is_ok(), point == Point::PostInspection);
-            assert!(
-                outcome.inventory.is_ok(),
-                "fixture must survive all post-reads"
-            );
-            assert!(outcome.recovery.is_ok());
-            if point == Point::PostInspection {
-                assert!(outcome.receipt.as_ref().unwrap().is_ok());
-            }
-            assert!(
-                !root.exists(),
-                "last worker releases only its disposable scope"
-            );
-        }
-    });
+    panic!("unexpected command loop");
 }

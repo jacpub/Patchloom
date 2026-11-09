@@ -111,6 +111,8 @@ jobs:
         with:
           command: fmt
           args: --all -- --check
+      - name: Check shared preview source formatting
+        run: rustfmt --edition 2018 --check src/inventory_preview/runtime.rs src/inventory_preview/install_runtime.rs src/inventory_preview/visible_acceptance.rs src/inventory_preview/visible_acceptance_tests.rs
 
   clippy:
     name: Clippy
