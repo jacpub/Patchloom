@@ -1,3 +1,4 @@
+// Patchloom lint maintenance, 2026-10-27; original license and attribution apply.
 use crate::config::Flavor;
 use crate::error::{DownloadError, RepositoryError};
 
@@ -230,7 +231,7 @@ impl RepositoryMetadata {
         let mut entries: Vec<_> = self.remote_packages.iter().collect();
         entries.sort_by_key(|(key, _)| *key);
 
-        if let Some((_, package)) = entries.get(0) {
+        if let Some((_, package)) = entries.first() {
             return package.modules.clone();
         }
 
@@ -249,7 +250,7 @@ pub struct RemotePackage {
 
 impl PartialOrd for RemotePackage {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.version.cmp(&other.version))
+        Some(self.cmp(other))
     }
 }
 
@@ -262,8 +263,11 @@ impl Ord for RemotePackage {
 /// This is the global channel used.
 /// If an addon has chosen `Default` as `ReleaseChannel`, we will `GlobalReleaseChannel`
 /// instead, which is saved in the config.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Hash, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Hash, PartialOrd, Ord, Default,
+)]
 pub enum GlobalReleaseChannel {
+    #[default]
     Stable,
     Beta,
     Alpha,
@@ -285,12 +289,6 @@ impl GlobalReleaseChannel {
     }
 }
 
-impl Default for GlobalReleaseChannel {
-    fn default() -> GlobalReleaseChannel {
-        GlobalReleaseChannel::Stable
-    }
-}
-
 impl std::fmt::Display for GlobalReleaseChannel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -308,8 +306,11 @@ impl std::fmt::Display for GlobalReleaseChannel {
 /// This is the channel used on an addon level.
 /// If `Default` is chosen, we will use the value from `GlobalReleaseChannel` which
 /// is saved in the config.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Hash, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Hash, PartialOrd, Ord, Default,
+)]
 pub enum ReleaseChannel {
+    #[default]
     Default,
     Stable,
     Beta,
@@ -323,12 +324,6 @@ impl ReleaseChannel {
         ReleaseChannel::Beta,
         ReleaseChannel::Alpha,
     ];
-}
-
-impl Default for ReleaseChannel {
-    fn default() -> ReleaseChannel {
-        ReleaseChannel::Default
-    }
 }
 
 impl std::fmt::Display for ReleaseChannel {
@@ -346,8 +341,11 @@ impl std::fmt::Display for ReleaseChannel {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Hash, PartialOrd, Ord, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Hash, PartialOrd, Ord, Deserialize, Default,
+)]
 pub enum CompressionFormat {
+    #[default]
     Zip,
     Zstd,
 }
@@ -360,12 +358,6 @@ impl CompressionFormat {
             CompressionFormat::Zip => "zip",
             CompressionFormat::Zstd => "tar.zst",
         }
-    }
-}
-
-impl Default for CompressionFormat {
-    fn default() -> CompressionFormat {
-        CompressionFormat::Zip
     }
 }
 
@@ -411,8 +403,7 @@ pub async fn batch_refresh_repository_packages(
     let curse_ids = repos
         .iter()
         .filter(|r| r.kind == RepositoryKind::Curse)
-        .map(|r| r.id.parse::<i32>().ok())
-        .flatten()
+        .filter_map(|r| r.id.parse::<i32>().ok())
         .collect::<Vec<_>>();
     let tukui_ids = repos
         .iter()

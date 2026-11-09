@@ -1,3 +1,4 @@
+// Patchloom lint maintenance, 2026-10-27; original license and attribution apply.
 use crate::catalog;
 use crate::error::FilesystemError;
 use crate::repository::CompressionFormat;
@@ -9,6 +10,7 @@ use std::fs::create_dir_all;
 use std::path::{Path, PathBuf};
 
 mod addons;
+pub mod legacy_import;
 mod wow;
 
 use crate::fs::PersistentData;
@@ -116,7 +118,7 @@ impl Config {
 
     /// Returns a `PathBuf` to the flavor directory.
     pub fn get_flavor_directory_for_flavor(&self, flavor: &Flavor, path: &Path) -> PathBuf {
-        path.join(&flavor.folder_name())
+        path.join(flavor.folder_name())
     }
 
     /// Returns a `Option<PathBuf>` to the root directory of the Flavor.
@@ -218,6 +220,10 @@ fn get_pattern_format(relative_path: &str) -> String {
 }
 
 impl PersistentData for Config {
+    // Preserve user settings on load errors; caches retain their own policy.
+    // Modified 2026-11-09; original GPLv3 applies.
+    const PRESERVE_LOAD_ERRORS: bool = true;
+
     fn relative_path() -> PathBuf {
         PathBuf::from("ajour.yml")
     }
@@ -258,8 +264,9 @@ impl Default for ColumnConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum SelfUpdateChannel {
+    #[default]
     Stable,
     Beta,
 }
@@ -267,12 +274,6 @@ pub enum SelfUpdateChannel {
 impl SelfUpdateChannel {
     pub const fn all() -> [Self; 2] {
         [SelfUpdateChannel::Stable, SelfUpdateChannel::Beta]
-    }
-}
-
-impl Default for SelfUpdateChannel {
-    fn default() -> Self {
-        SelfUpdateChannel::Stable
     }
 }
 
@@ -287,10 +288,13 @@ impl Display for SelfUpdateChannel {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Hash, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Hash, PartialOrd, Ord, Default,
+)]
 pub enum Language {
     Czech,
     Norwegian,
+    #[default]
     English,
     Danish,
     German,
@@ -373,19 +377,13 @@ impl Language {
     }
 }
 
-impl Default for Language {
-    fn default() -> Language {
-        Language::English
-    }
-}
-
 /// Returns a Config.
 ///
 /// This functions handles the initialization of a Config.
 pub async fn load_config() -> Result<Config, FilesystemError> {
     log::debug!("loading config");
 
-    Ok(Config::load_or_default()?)
+    Config::load_or_default()
 }
 
 const fn default_true() -> bool {

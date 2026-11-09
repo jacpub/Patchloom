@@ -43,6 +43,13 @@ pub enum DownloadError {
         code: isahc::http::StatusCode,
         url: String,
     },
+    // Modified 2026-10-28; original GPLv3 applies.
+    #[error("Rate limit response ({code}); release checks require a manual retry after the wait")]
+    RateLimited {
+        code: isahc::http::StatusCode,
+        retry_after: std::time::Duration,
+    },
+
     #[error("No new release binary available for {bin_name}")]
     MissingSelfUpdateRelease { bin_name: String },
     #[error("Catalog failed to download")]

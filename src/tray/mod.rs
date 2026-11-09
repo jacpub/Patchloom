@@ -1,3 +1,4 @@
+// Patchloom lint maintenance, 2026-10-27; original license and attribution apply.
 use std::mem;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -325,11 +326,9 @@ unsafe extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    let mut state: &mut TrayState;
-
     if msg == WM_CREATE {
         let create_struct = &*(lparam as *const CREATESTRUCTW);
-        state = &mut *(create_struct.lpCreateParams as *mut TrayState);
+        let state = &mut *(create_struct.lpCreateParams as *mut TrayState);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as *mut _ as LPARAM);
 
         add_icon(hwnd);
@@ -339,10 +338,9 @@ unsafe extern "system" fn window_proc(
         }
 
         return 0;
-    } else {
-        let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
-        state = &mut *(ptr as *mut TrayState);
     }
+    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    let state = &mut *(ptr as *mut TrayState);
 
     match msg {
         WM_CLOSE => {
@@ -424,7 +422,7 @@ unsafe extern "system" fn window_proc(
 }
 
 unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
-    let mut state = &mut *(lparam as *mut TrayState);
+    let state = &mut *(lparam as *mut TrayState);
 
     let mut id = mem::zeroed();
     GetWindowThreadProcessId(hwnd, &mut id);

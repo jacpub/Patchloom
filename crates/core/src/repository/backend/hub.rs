@@ -1,3 +1,4 @@
+// Patchloom lint maintenance, 2026-10-27; original license and attribution apply.
 use super::*;
 use crate::config::Flavor;
 use crate::error::{DownloadError, RepositoryError};
@@ -22,7 +23,7 @@ pub struct Hub {
 #[async_trait]
 impl Backend for Hub {
     async fn get_metadata(&self) -> Result<RepositoryMetadata, RepositoryError> {
-        let packages = fetch_remote_packages(self.flavor, &[self.id.clone()]).await?;
+        let packages = fetch_remote_packages(self.flavor, std::slice::from_ref(&self.id)).await?;
 
         let package = packages
             .into_iter()
@@ -162,8 +163,10 @@ pub struct HubPackage {
 #[derive(Clone, Debug, Deserialize)]
 pub struct HubGameVersion {
     game_type: Flavor,
-    interface: String,
-    title: String,
+    #[serde(rename = "interface")]
+    _interface: String,
+    #[serde(rename = "title")]
+    _title: String,
     version: String,
 }
 

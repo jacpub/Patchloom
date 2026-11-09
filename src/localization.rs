@@ -71,3 +71,38 @@ pub fn localized_timeago_formatter() -> timeago::Formatter<Box<dyn timeago::Lang
         timeago::Formatter::with_language(Box::new(timeago::English))
     }
 }
+
+#[cfg(test)]
+mod compatibility_tests {
+    use super::*;
+
+    #[test]
+    fn regex_upgrade_preserves_shipped_localization_lookup() {
+        // Explicit locales avoid changing process-global LANG in parallel tests.
+        assert_eq!(
+            get_text!(LOCALIZATION_CTX, "en_US", "about")
+                .unwrap()
+                .to_string(),
+            "About"
+        );
+        assert_eq!(
+            get_text!(LOCALIZATION_CTX, "de_DE", "about")
+                .unwrap()
+                .to_string(),
+            "Über Ajour"
+        );
+        assert_eq!(
+            get_text!(LOCALIZATION_CTX, "en_US", "addons-loaded")
+                .unwrap()
+                .to_string(),
+            "{number} {flavor} addons loaded"
+        );
+        assert_eq!(
+            get_text!(LOCALIZATION_CTX, "unknown_LOCALE", "about")
+                .unwrap()
+                .to_string(),
+            "About"
+        );
+        assert!(get_text!(LOCALIZATION_CTX, "en_US", "patchloom-missing-test-key").is_none());
+    }
+}

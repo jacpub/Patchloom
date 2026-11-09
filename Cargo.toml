@@ -11,11 +11,19 @@ keywords = ["addon-manager", "wow", "world-of-warcraft", "addon"]
 categories = ["graphics", "gui", "games"]
 edition = "2018"
 
+# Explicit offline native acceptance; never a normal application entry point.
+[[test]]
+name = "offline_acceptance"
+path = "tests/offline_acceptance.rs"
+harness = false
+required-features = ["fixture-tests", "no-self-update"]
+
 [features]
 default = ["opengl"]
 wgpu = ["ajour-widgets/wgpu", "iced/wgpu", "iced/default_system_font"]
 opengl = ["ajour-widgets/opengl", "iced/glow", "iced/glow_default_system_font"]
 no-self-update = ["ajour-core/no-self-update"]
+fixture-tests = ["ajour-core/fixture-tests"]
 debug = ["iced/debug"]
 
 [dependencies]
@@ -60,6 +68,9 @@ winapi = "0.3.9"
 
 [build-dependencies]
 embed-resource = "1.3.3"
+
+[dev-dependencies]
+tempfile = "3.2.0"
 
 [workspace]
 members = [

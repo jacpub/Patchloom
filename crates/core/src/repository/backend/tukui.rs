@@ -1,3 +1,4 @@
+// Patchloom lint maintenance, 2026-10-27; original license and attribution apply.
 use super::*;
 use crate::config::Flavor;
 use crate::error::{DownloadError, RepositoryError};
@@ -77,7 +78,7 @@ pub(crate) fn metadata_from_tukui_package(package: TukuiPackage) -> RepositoryMe
         let date_time = NaiveDateTime::parse_from_str(&package.lastupdate, "%Y-%m-%d %H:%M:%S")
             .map_or(
                 NaiveDateTime::parse_from_str(
-                    &format!("{} 00:00:00", &package.lastupdate),
+                    &format!("{} 00:00:00", package.lastupdate),
                     "%Y-%m-%d %T",
                 ),
                 std::result::Result::Ok,

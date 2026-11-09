@@ -1,3 +1,4 @@
+// Patchloom lint maintenance, 2026-10-27; original license and attribution apply.
 use {
     super::{DEFAULT_FONT_SIZE, DEFAULT_PADDING},
     crate::gui::{
@@ -99,11 +100,11 @@ pub fn titles_row_header<'a>(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn data_row_container<'a, 'b>(
+pub fn data_row_container<'a>(
     color_palette: ColorPalette,
     config: &Config,
     addon: &'a mut CatalogRow,
-    column_config: &'b [(CatalogColumnKey, Length, bool)],
+    column_config: &[(CatalogColumnKey, Length, bool)],
     installed_for_flavor: bool,
     install_addon: Option<&InstallAddon>,
     is_odd: Option<bool>,
@@ -162,7 +163,7 @@ pub fn data_row_container<'a, 'b>(
             .width(*width);
 
         if flavor_exists_for_addon
-            && (status == Some(InstallStatus::Retry) || (status == None && !installed_for_flavor))
+            && (status == Some(InstallStatus::Retry) || (status.is_none() && !installed_for_flavor))
         {
             install_button = install_button.on_press(Interaction::InstallAddon(
                 config.wow.flavor,
@@ -251,7 +252,7 @@ pub fn data_row_container<'a, 'b>(
         })
         .next()
     {
-        let source = Text::new(&format!("{}", addon_data.source)).size(DEFAULT_FONT_SIZE);
+        let source = Text::new(format!("{}", addon_data.source)).size(DEFAULT_FONT_SIZE);
         let source_container = Container::new(source)
             .height(default_height)
             .width(*width)
@@ -279,8 +280,7 @@ pub fn data_row_container<'a, 'b>(
             .versions
             .iter()
             .find(|v| v.flavor == config.wow.flavor.base_flavor())
-            .map(|v| v.game_version.clone())
-            .flatten()
+            .and_then(|v| v.game_version.clone())
             .map(|gv| match addon_data.source {
                 Source::Hub => format_interface_into_game_version(&gv[..]),
                 _ => gv,
@@ -314,8 +314,7 @@ pub fn data_row_container<'a, 'b>(
             .versions
             .iter()
             .find(|v| v.flavor == config.wow.flavor.base_flavor())
-            .map(|v| v.date)
-            .flatten();
+            .and_then(|v| v.date);
         let release_date_text: String = if let Some(date_released) = version_date {
             let f = localized_timeago_formatter();
             let now = Local::now();
@@ -347,7 +346,7 @@ pub fn data_row_container<'a, 'b>(
         .next()
     {
         let num_downloads = Text::new(
-            &addon_data
+            addon_data
                 .number_of_downloads
                 .to_formatted_string(&Locale::en),
         )
@@ -374,7 +373,7 @@ pub fn data_row_container<'a, 'b>(
         })
         .next()
     {
-        let categories = Text::new(&addon_data.categories.join(", ")).size(DEFAULT_FONT_SIZE);
+        let categories = Text::new(addon_data.categories.join(", ")).size(DEFAULT_FONT_SIZE);
         let categories_container = Container::new(categories)
             .height(default_height)
             .width(*width)
@@ -391,7 +390,7 @@ pub fn data_row_container<'a, 'b>(
     let mut row = Row::new().push(left_spacer).spacing(1);
 
     // Sort columns and push them into row
-    row_containers.sort_by(|a, b| a.0.cmp(&b.0));
+    row_containers.sort_by_key(|a| a.0);
     for (_, elem) in row_containers.into_iter() {
         row = row.push(elem);
     }

@@ -9,11 +9,23 @@ use std::sync::Mutex;
 
 mod addon;
 pub mod backup;
+mod install;
+pub(crate) mod ownership;
 mod save;
 #[cfg(feature = "gui")]
 mod theme;
 
-pub use addon::{delete_addons, delete_saved_variables, install_addon};
+pub use addon::{delete_addons, delete_saved_variables};
+pub(crate) use install::component as validate_component;
+pub(crate) use install::install_addon_checked;
+pub use install::{
+    inspect_recovery, install_addon, preflight_restore_originals, restore_originals,
+    restore_originals_checked, RecoveryApproval, RecoveryInspection, RecoveryRestoreOutcome,
+};
+pub(crate) use install::{
+    install_addon_guarded, prepare_archive, require_clean_install, PreparedArchive,
+};
+pub use ownership::{inspect_ownership, OwnershipPreview};
 pub use save::PersistentData;
 #[cfg(feature = "gui")]
 pub use theme::{import_theme, load_user_themes};
@@ -55,4 +67,4 @@ pub fn config_dir() -> PathBuf {
     config_dir
 }
 
-type Result<T, E = FilesystemError> = std::result::Result<T, E>;
+pub(crate) type Result<T, E = FilesystemError> = std::result::Result<T, E>;

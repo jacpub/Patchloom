@@ -1,3 +1,4 @@
+// Patchloom lint maintenance, 2026-10-27; original license and attribution apply.
 use super::*;
 use crate::config::Flavor;
 use crate::error::{DownloadError, RepositoryError};
@@ -23,7 +24,7 @@ pub struct WowI {
 #[async_trait]
 impl Backend for WowI {
     async fn get_metadata(&self) -> Result<RepositoryMetadata, RepositoryError> {
-        let packages = fetch_remote_packages(&[self.id.clone()]).await?;
+        let packages = fetch_remote_packages(std::slice::from_ref(&self.id)).await?;
 
         let package = packages
             .into_iter()

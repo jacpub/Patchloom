@@ -21,6 +21,20 @@ use std::convert::TryFrom;
 use std::hash::Hasher;
 
 pub fn install_from_source(url: Uri, flavor: Flavor) -> Result<()> {
+    install_with_repository(url, flavor, RepositoryPackage::from_source_url)
+}
+
+fn install_with_repository(
+    url: Uri,
+    flavor: Flavor,
+    create: impl FnOnce(
+        Flavor,
+        Uri,
+    )
+        -> std::result::Result<RepositoryPackage, ajour_core::error::RepositoryError>,
+) -> Result<()> {
+    // Validate source construction before touching configuration or the network.
+    let mut repo_package = create(flavor, url.clone())?;
     task::block_on(async {
         log::debug!("Fetching remote info for {:?}", &url);
 
@@ -36,7 +50,6 @@ pub fn install_from_source(url: Uri, flavor: Flavor) -> Result<()> {
         let fingerprint_cache = Arc::new(Mutex::new(load_fingerprint_cache().await?));
 
         // Fetch the remote repo metadata
-        let mut repo_package = RepositoryPackage::from_source_url(Flavor::Retail, url)?;
         repo_package.resolve_metadata().await?;
 
         // Build an addon using this repo package
@@ -102,4 +115,30 @@ pub fn install_from_source(url: Uri, flavor: Flavor) -> Result<()> {
 
         Result::Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn selected_client_reaches_source_metadata_factory_before_config_or_network() {
+        for flavor in Flavor::ALL {
+            for host in ["github.com", "gitlab.com"] {
+                let url: Uri = format!("https://{host}/fixture/addon").parse().unwrap();
+                let mut called = false;
+                let error =
+                    install_with_repository(url.clone(), flavor, |received, received_url| {
+                        called = true;
+                        assert_eq!(received, flavor);
+                        assert_eq!(received_url, url);
+                        Err(ajour_core::error::RepositoryError::GitInvalidHost {
+                            host: "stop-before-config".into(),
+                        })
+                    })
+                    .unwrap_err();
+                assert!(called);
+                assert!(error.to_string().contains("stop-before-config"));
+            }
+        }
+    }
 }
